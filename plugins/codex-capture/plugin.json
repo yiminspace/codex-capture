@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "codex-capture",
+  "version": "0.4.6",
+  "description": "Capture with Option+S, route tasks with Luna, and follow progress, history and diagnostics in a local Voyage workbench.",
+  "extensions": {
+    "com.openai": {
+      "requires_local_executor": true,
+      "interface": {
+        "displayName": "Codex Capture",
+        "shortDescription": "截图任务自动分发与跟进",
+        "category": "Productivity",
+        "defaultPrompt": [
+          "把这张截图和我的描述交给 Codex Capture，自动判断项目并开始任务。"
+        ]
+      }
+    }
+  }
+}

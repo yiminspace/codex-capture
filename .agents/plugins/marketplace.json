@@ -1,0 +1,20 @@
+{
+  "name": "codex-capture-local",
+  "interface": {
+    "displayName": "Codex Capture Local"
+  },
+  "plugins": [
+    {
+      "name": "codex-capture",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-capture"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

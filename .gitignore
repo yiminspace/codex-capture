@@ -1,0 +1,16 @@
+.local/
+__pycache__/
+*.pyc
+dist/
+node_modules/
+web/test-results/
+web/playwright-report/
+VALIDATION*.md
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+*.jsonl
+.venv/
+followup.txt

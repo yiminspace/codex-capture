@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Public source checks
+        run: python scripts/package_release.py --check
+      - name: Python tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.13.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - name: Frontend checks
+        working-directory: web
+        run: |
+          pnpm test
+          pnpm build
+          pnpm exec playwright install --with-deps chromium
+          pnpm test:browser
+      - name: Check committed web assets
+        run: git diff --exit-code -- plugins/codex-capture/web
+      - name: Validate release archive
+        run: python scripts/package_release.py
+
+  macos-helper:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer syntax
+        run: bash -n install.sh
+      - name: Compile and self-test without UI
+        run: |
+          xcrun swiftc -warnings-as-errors \
+            -framework AppKit -framework Carbon -framework ApplicationServices \
+            plugins/codex-capture/native/CaptureApp.swift \
+            -o "$RUNNER_TEMP/CodexCapture"
+          "$RUNNER_TEMP/CodexCapture" --self-test
+          plutil -lint plugins/codex-capture/native/Info.plist
