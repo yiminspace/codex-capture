@@ -192,6 +192,33 @@ class HttpTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, error.read(), error.headers
 
+    def test_settings_persist_with_auth_validation_and_no_history_rewrite(self):
+        config = {"classifierModel": "fixture-classifier", "taskModel": "", "followup": "  synthetic fixture\n"}
+        before = (self.root / "jobs" / JOB / "request.json").read_bytes()
+        self.assertEqual(self.request("/api/settings", auth=False)[0], 401)
+        self.assertEqual(self.request("/api/settings", method="POST", data=json.dumps(config).encode(), headers={"Origin": "https://external.invalid"})[0], 403)
+        self.assertEqual(self.request("/api/settings", method="POST", data=json.dumps(config).encode())[0], 200)
+        code, body, _ = self.request("/api/settings")
+        self.assertEqual(code, 200); self.assertEqual(json.loads(body), config)
+        self.assertEqual((self.root / "jobs" / JOB / "request.json").read_bytes(), before)
+        invalid = {**config, "taskModel": "bad\nmodel"}
+        self.assertEqual(self.request("/api/settings", method="POST", data=json.dumps(invalid).encode())[0], 400)
+        self.assertEqual(json.loads(self.request("/api/settings")[1]), config)
+        self.assertEqual((self.root / "settings.json").stat().st_mode & 0o777, 0o600)
+
+    def test_annotated_image_route_stays_in_job_directory(self):
+        directory = self.root / "jobs" / JOB
+        request = gui.read_object(directory / "request.json")
+        request["annotatedImage"] = str(directory / "annotated.png")
+        gui.atomic_json(directory / "request.json", request)
+        (directory / "annotated.png").write_bytes(b"synthetic-annotations")
+        self.assertEqual(self.request(f"/api/jobs/{JOB}/annotated-image", auth=False)[0], 401)
+        self.assertEqual(self.request(f"/api/jobs/{JOB}/annotated-image")[1], b"synthetic-annotations")
+        (directory / "annotated.png").unlink()
+        (directory / "annotated.png").symlink_to(self.root / "outside.png")
+        (self.root / "outside.png").write_bytes(b"outside")
+        self.assertEqual(self.request(f"/api/jobs/{JOB}/annotated-image")[0], 404)
+
     def test_api_auth_host_and_mutation_origin_are_enforced(self):
         self.assertEqual(self.request("/api/jobs", auth=False)[0], 401)
         self.assertEqual(self.request("/api/jobs", headers={"Authorization": "Bearer wrong"})[0], 401)

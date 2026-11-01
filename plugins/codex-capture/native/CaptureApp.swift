@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Carbon
 import Foundation
+import ScreenCaptureKit
 
 private let appID = "com.yiminlab.codex-capture"
 private let helperVersion = "0.5.1"
@@ -33,9 +34,9 @@ private struct ScreenCapturePermissionState {
     }
 }
 
-private func submissionArguments(preparationID: String, text: String) -> [String] {
+private func submissionArguments(preparationID: String, text: String, annotatedImage: String? = nil) -> [String] {
     // Keep the user's text byte-for-byte, including leading dashes and whitespace.
-    ["submit", "--preparation-id", preparationID, "--text=" + text]
+    ["submit", "--preparation-id", preparationID, "--text=" + text] + (annotatedImage.map { ["--annotated-image", $0] } ?? [])
 }
 
 private func validDescription(_ text: String) -> Bool {
@@ -93,7 +94,8 @@ private func writeJSON(_ value: Any, to url: URL) throws {
 private func safeURL(_ value: String) -> String? {
     guard var url = URLComponents(string: value), let scheme = url.scheme,
           ["http", "https", "file"].contains(scheme.lowercased()) else { return nil }
-    url.user = nil; url.password = nil; url.query = nil; url.fragment = nil
+    url.user = nil; url.password = nil; url.query = nil
+    url.fragment = url.fragment.flatMap { $0.hasPrefix("/") ? String($0.split(separator: "?", maxSplits: 1)[0]) : nil }
     return url.string.map { String($0.prefix(500)) }
 }
 
@@ -106,6 +108,18 @@ private func axString(_ element: AXUIElement, _ name: String) -> String? {
     let value = axValue(element, name) as? String
     guard let value, !value.isEmpty else { return nil }
     return String(value.prefix(500))
+}
+
+private func axFrame(_ element: AXUIElement) -> CGRect? {
+    guard let position = axValue(element, kAXPositionAttribute as String),
+          let size = axValue(element, kAXSizeAttribute as String),
+          CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID() else { return nil }
+    var point = CGPoint.zero
+    var dimensions = CGSize.zero
+    guard AXValueGetValue(unsafeBitCast(position, to: AXValue.self), .cgPoint, &point),
+          AXValueGetValue(unsafeBitCast(size, to: AXValue.self), .cgSize, &dimensions) else { return nil }
+    let frame = CGRect(origin: point, size: dimensions)
+    return frame.isEmpty ? nil : frame
 }
 
 /// Reads one focused window only, when the user has enabled this feature and
@@ -136,6 +150,7 @@ private func foregroundContext(_ app: NSRunningApplication?, includeAX: Bool) ->
         return context
     }
     let window = unsafeBitCast(rawWindow, to: AXUIElement.self)
+    let viewport = axFrame(window)
     var windowInfo: [String: String] = [:]
     if let title = axString(window, kAXTitleAttribute as String) { windowInfo["title"] = title }
     if let document = axString(window, kAXDocumentAttribute as String), let url = safeURL(document) { windowInfo["url"] = url }
@@ -153,7 +168,14 @@ private func foregroundContext(_ app: NSRunningApplication?, includeAX: Bool) ->
         let entry = pending[cursor]; cursor += 1
         let element = entry.element
         guard visited.insert(CFHash(element)).inserted else { continue }
+        if let viewport, let frame = axFrame(element), !viewport.intersects(frame) { continue }
+        if (axValue(element, "AXHidden") as? Bool) == true { continue }
         guard let role = axString(element, kAXRoleAttribute as String) else { continue }
+        if role == "AXWebArea", let raw = axValue(element, kAXURLAttribute as String),
+           let url = safeURL((raw as? URL)?.absoluteString ?? (raw as? String) ?? "") {
+            windowInfo["url"] = url
+            context["window"] = windowInfo
+        }
         let subrole = axString(element, kAXSubroleAttribute as String) ?? ""
         let secure = subrole.localizedCaseInsensitiveContains("secure") || role.localizedCaseInsensitiveContains("secure")
         var node: [String: Any] = ["role": role, "depth": entry.depth]
@@ -183,7 +205,12 @@ private func foregroundContext(_ app: NSRunningApplication?, includeAX: Bool) ->
         var rawChildren: CFArray?
         let maxChildren = min(50, 300 - pending.count)
         if maxChildren <= 0 { truncated = true; continue }
-        if AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, maxChildren, &rawChildren) == .success,
+        // Visible children keep scrolled-out document text out of the budget.
+        let visible = axValue(element, "AXVisibleChildren") as? [AXUIElement]
+        if let children = visible, !children.isEmpty {
+            pending.append(contentsOf: children.prefix(maxChildren).map { Pending(element: $0, depth: entry.depth + 1, parent: index) })
+            if children.count > maxChildren { truncated = true }
+        } else if AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, maxChildren, &rawChildren) == .success,
            let children = rawChildren as? [AXUIElement] {
             pending.append(contentsOf: children.map { Pending(element: $0, depth: entry.depth + 1, parent: index) })
             if children.count == maxChildren { truncated = true }
@@ -236,10 +263,603 @@ private final class CaptureInputWindow: NSWindow {
     }
 }
 
+/// Keep JSON byte content intact while coloring its lexical tokens.
+private func highlightedJSON(_ text: String) -> NSAttributedString {
+    let result = NSMutableAttributedString(string: text, attributes: [
+        .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+        .foregroundColor: NSColor.labelColor,
+    ])
+    let pattern = #""(?:[^"\\]|\\.)*"\s*:|"(?:[^"\\]|\\.)*"|\b(?:true|false|null)\b|-?\b[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return result }
+    let source = text as NSString
+    for match in regex.matches(in: text, range: NSRange(location: 0, length: source.length)) {
+        let token = source.substring(with: match.range)
+        let color: NSColor
+        if token.hasSuffix(":") { color = .systemBlue }
+        else if token.hasPrefix("\"") { color = .systemGreen }
+        else if ["true", "false", "null"].contains(token) { color = .systemPurple }
+        else { color = .systemOrange }
+        result.addAttribute(.foregroundColor, value: color, range: match.range)
+    }
+    return result
+}
+
+private struct CaptureMark {
+    let tool: Int
+    let color: NSColor
+    let stroke: CGFloat
+    var points: [NSPoint]
+    var text = ""
+}
+
+private final class AnnotationCanvas: NSView {
+    let image: NSImage
+    var marks: [CaptureMark]
+    var tool = 0
+    var ink: NSColor = .systemRed
+    var stroke: CGFloat = 3
+    private var draft: CaptureMark?
+    private var history = [[CaptureMark]]()
+    private let padding: CGFloat
+
+    init(image: NSImage, marks: [CaptureMark], padding: CGFloat = 16) {
+        self.padding = padding
+        self.image = image; self.marks = marks
+        super.init(frame: .zero)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.image)
+        setAccessibilityLabel("截图标注画布")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var acceptsFirstResponder: Bool { true }
+    private var imageRect: NSRect {
+        let bounds = bounds.insetBy(dx: padding, dy: padding)
+        let scale = min(bounds.width / max(image.size.width, 1), bounds.height / max(image.size.height, 1))
+        let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+        return NSRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2, width: size.width, height: size.height)
+    }
+    private func normalized(_ event: NSEvent) -> NSPoint {
+        let point = convert(event.locationInWindow, from: nil)
+        let rect = imageRect
+        return NSPoint(x: min(1, max(0, (point.x - rect.minX) / max(rect.width, 1))),
+                       y: min(1, max(0, (point.y - rect.minY) / max(rect.height, 1))))
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.underPageBackgroundColor.setFill(); bounds.fill()
+        render(in: imageRect, includingDraft: true)
+    }
+    private func render(in rect: NSRect, includingDraft: Bool) {
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: rect).addClip()
+        image.draw(in: rect)
+        for mark in marks + (includingDraft ? draft.map { [$0] } ?? [] : []) {
+            let points = mark.points.map { NSPoint(x: rect.minX + $0.x * rect.width, y: rect.minY + $0.y * rect.height) }
+            guard let first = points.first, let last = points.last else { continue }
+            mark.color.setStroke(); mark.color.setFill()
+            let width = max(0.5, mark.stroke * rect.width)
+            let path = NSBezierPath(); path.lineWidth = width
+            path.lineCapStyle = .round; path.lineJoinStyle = .round
+            let box = NSRect(x: min(first.x, last.x), y: min(first.y, last.y), width: abs(last.x - first.x), height: abs(last.y - first.y))
+            switch mark.tool {
+            case 1: path.appendRect(box)
+            case 2: path.appendOval(in: box)
+            case 3:
+                path.move(to: first); path.line(to: last)
+                let angle = atan2(last.y - first.y, last.x - first.x)
+                let length = max(width * 4, rect.width * 0.016)
+                for offset in [-CGFloat.pi / 6, CGFloat.pi / 6] {
+                    path.move(to: last)
+                    path.line(to: NSPoint(x: last.x - cos(angle + offset) * length, y: last.y - sin(angle + offset) * length))
+                }
+            case 4:
+                (mark.text as NSString).draw(at: first, withAttributes: [
+                    .font: NSFont.systemFont(ofSize: max(1, mark.stroke * rect.width * 7), weight: .semibold),
+                    .foregroundColor: mark.color,
+                ])
+            default:
+                if points.count == 1 {
+                    path.appendOval(in: NSRect(x: first.x - width / 2, y: first.y - width / 2, width: width, height: width)); path.fill()
+                } else {
+                    path.move(to: first)
+                    for point in points.dropFirst() { path.line(to: point) }
+                }
+            }
+            if mark.tool != 4 { path.stroke() }
+        }
+        NSGraphicsContext.restoreGraphicsState()
+    }
+    override func mouseDown(with event: NSEvent) {
+        guard imageRect.contains(convert(event.locationInWindow, from: nil)), marks.count < 500 else { return }
+        window?.makeFirstResponder(self)
+        var mark = CaptureMark(tool: tool, color: ink, stroke: stroke / max(imageRect.width, 1), points: [normalized(event)])
+        if tool == 4 {
+            let alert = NSAlert(); alert.messageText = "添加文字"
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 26))
+            field.placeholderString = "输入标注文字"
+            alert.accessoryView = field
+            alert.addButton(withTitle: "添加"); alert.addButton(withTitle: "取消")
+            alert.window.level = window?.level ?? .normal
+            alert.window.initialFirstResponder = field
+            guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            mark.text = String(field.stringValue.prefix(1000))
+            history.append(marks); marks.append(mark)
+        } else { draft = mark }
+        needsDisplay = true
+    }
+    override func mouseDragged(with event: NSEvent) {
+        guard var mark = draft else { return }
+        if mark.tool == 0 { mark.points.append(normalized(event)) }
+        else { mark.points = [mark.points[0], normalized(event)] }
+        draft = mark; needsDisplay = true
+    }
+    override func mouseUp(with event: NSEvent) {
+        guard let mark = draft else { return }
+        history.append(marks); marks.append(mark); draft = nil; needsDisplay = true
+    }
+    @objc func undoMark(_ sender: Any?) {
+        guard let previous = history.popLast() else {
+            if !marks.isEmpty { marks.removeLast(); needsDisplay = true }
+            return
+        }
+        marks = previous; draft = nil; needsDisplay = true
+    }
+    @objc func clearMarks(_ sender: Any?) {
+        guard !marks.isEmpty else { return }
+        history.append(marks); marks = []; draft = nil; needsDisplay = true
+    }
+    func renderedImage() throws -> NSImage {
+        let pixelsWide = image.representations.map(\.pixelsWide).max() ?? Int(image.size.width)
+        let pixelsHigh = image.representations.map(\.pixelsHigh).max() ?? Int(image.size.height)
+        guard pixelsWide > 0, pixelsHigh > 0, pixelsWide <= 32768, pixelsHigh <= 32768,
+              pixelsWide * pixelsHigh <= 100_000_000,
+              let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixelsWide, pixelsHigh: pixelsHigh,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let graphics = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            throw NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "截图过大，无法导出标注图。"])
+        }
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = graphics
+        render(in: NSRect(x: 0, y: 0, width: pixelsWide, height: pixelsHigh), includingDraft: false)
+        NSGraphicsContext.restoreGraphicsState()
+        let result = NSImage(size: image.size); result.addRepresentation(bitmap)
+        return result
+    }
+}
+
+private final class AnnotationController: NSWindowController, NSWindowDelegate {
+    let canvas: AnnotationCanvas
+    var onApply: (([CaptureMark], NSImage?) -> Void)?
+    private let tools = NSSegmentedControl(labels: ["画笔", "矩形", "圆圈", "箭头", "文字"], trackingMode: .selectOne, target: nil, action: nil)
+    private let colors = NSSegmentedControl(labels: ["红", "橙", "蓝", "绿", "黑", "白"], trackingMode: .selectOne, target: nil, action: nil)
+    private let width = NSSlider(value: 3, minValue: 1, maxValue: 10, target: nil, action: nil)
+
+    init(image: NSImage, marks: [CaptureMark]) {
+        canvas = AnnotationCanvas(image: image, marks: marks)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 680), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.title = "标注截图"; window.minSize = NSSize(width: 800, height: 500)
+        super.init(window: window); window.delegate = self
+        tools.selectedSegment = 0; tools.target = self; tools.action = #selector(changeTool)
+        colors.selectedSegment = 0; colors.target = self; colors.action = #selector(changeColor)
+        width.target = self; width.action = #selector(changeWidth); width.setAccessibilityLabel("画笔粗细")
+        width.widthAnchor.constraint(equalToConstant: 100).isActive = true
+        let undo = NSButton(title: "撤销", target: canvas, action: #selector(AnnotationCanvas.undoMark))
+        undo.keyEquivalent = "z"; undo.keyEquivalentModifierMask = .command
+        let clear = NSButton(title: "清空", target: canvas, action: #selector(AnnotationCanvas.clearMarks))
+        let toolbar = NSStackView(views: [tools, colors, NSTextField(labelWithString: "粗细"), width, undo, clear])
+        toolbar.spacing = 10; toolbar.orientation = .horizontal
+        let cancel = NSButton(title: "取消", target: self, action: #selector(cancelEditor))
+        cancel.keyEquivalent = "\u{1b}"; cancel.keyEquivalentModifierMask = []
+        let apply = NSButton(title: "使用标注", target: self, action: #selector(applyMarks))
+        apply.keyEquivalent = "\r"; apply.keyEquivalentModifierMask = .command
+        for button in [undo, clear, cancel, apply] { button.bezelStyle = .rounded }
+        let hint = NSTextField(labelWithString: "拖动绘制 · 选择文字工具后点击添加 · ⌘Z 撤销 · 原图保留")
+        hint.font = .systemFont(ofSize: 11); hint.textColor = .secondaryLabelColor
+        let footer = NSStackView(views: [hint, NSView(), cancel, apply]); footer.spacing = 10
+        guard let content = window.contentView else { return }
+        for item in [toolbar, canvas, footer] { item.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(item) }
+        NSLayoutConstraint.activate([
+            toolbar.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            toolbar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            toolbar.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -16),
+            canvas.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 12),
+            canvas.leadingAnchor.constraint(equalTo: content.leadingAnchor), canvas.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            footer.topAnchor.constraint(equalTo: canvas.bottomAnchor, constant: 12),
+            footer.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16), footer.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            footer.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    @objc private func changeTool() { canvas.tool = tools.selectedSegment }
+    @objc private func changeColor() { canvas.ink = [NSColor.systemRed, .systemOrange, .systemBlue, .systemGreen, .black, .white][colors.selectedSegment] }
+    @objc private func changeWidth() { canvas.stroke = CGFloat(width.doubleValue) }
+    @objc func cancelEditor() { if let parent = window?.sheetParent, let window { parent.endSheet(window) }; window?.orderOut(nil) }
+    @objc private func applyMarks() {
+        do {
+            let rendered = canvas.marks.isEmpty ? nil : try canvas.renderedImage()
+            onApply?(canvas.marks, rendered)
+            cancelEditor()
+        } catch {
+            let alert = NSAlert(); alert.messageText = "标注图未能导出"; alert.informativeText = error.localizedDescription; alert.runModal()
+        }
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { cancelEditor(); return false }
+}
+
+private func captureBitmapImage(_ image: CGImage, logicalSize: NSSize) -> NSImage {
+    let bitmap = NSBitmapImageRep(cgImage: image)
+    bitmap.size = logicalSize
+    let result = NSImage(size: logicalSize)
+    result.addRepresentation(bitmap)
+    return result
+}
+
+private func capturePixelRect(_ selection: NSRect, viewSize: NSSize, pixelSize: NSSize) -> NSRect {
+    guard viewSize.width > 0, viewSize.height > 0 else { return .zero }
+    let clipped = selection.intersection(NSRect(origin: .zero, size: viewSize))
+    guard !clipped.isNull, !clipped.isEmpty else { return .zero }
+    let sx = pixelSize.width / viewSize.width, sy = pixelSize.height / viewSize.height
+    let x = floor(clipped.minX * sx), y = floor((viewSize.height - clipped.maxY) * sy)
+    return NSRect(x: x, y: y, width: ceil(clipped.maxX * sx) - x,
+                  height: ceil((viewSize.height - clipped.minY) * sy) - y)
+        .intersection(NSRect(origin: .zero, size: pixelSize))
+}
+
+private final class CaptureOverlayWindow: NSWindow {
+    var onCancel: (() -> Void)?
+    var onComplete: (() -> Void)?
+    var onUndo: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown {
+            if event.keyCode == 53 { onCancel?(); return }
+            if event.keyCode == 36 { onComplete?(); return }
+            if event.keyCode == 6 && event.modifierFlags.contains(.command) { onUndo?(); return }
+        }
+        super.sendEvent(event)
+    }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.keyCode == 53 { onCancel?(); return true }
+        if event.keyCode == 36 { onComplete?(); return true }
+        if event.keyCode == 6 && event.modifierFlags.contains(.command) { onUndo?(); return true }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+private final class CaptureHUDView: NSView {
+    var title = ""
+    var headerHeight: CGFloat = 32
+    private var anchor: NSPoint?
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.setFill()
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8)
+        path.fill(); NSColor.separatorColor.setStroke(); path.lineWidth = 1; path.stroke()
+        if !title.isEmpty {
+            (title as NSString).draw(at: NSPoint(x: 14, y: bounds.height - 24), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor,
+            ])
+        }
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        if bounds.contains(local), local.y > bounds.height - headerHeight, local.x < bounds.width - 36 { return self }
+        return super.hitTest(point)
+    }
+    override func mouseDown(with event: NSEvent) { anchor = superview?.convert(event.locationInWindow, from: nil) }
+    override func mouseDragged(with event: NSEvent) {
+        guard let parent = superview, let anchor else { return }
+        let point = parent.convert(event.locationInWindow, from: nil)
+        var origin = frame.origin
+        origin.x = min(parent.bounds.maxX - frame.width, max(0, origin.x + point.x - anchor.x))
+        origin.y = min(parent.bounds.maxY - frame.height, max(0, origin.y + point.y - anchor.y))
+        setFrameOrigin(origin); self.anchor = point
+    }
+}
+
+private final class CaptureSelectionView: NSView {
+    let snapshot: CGImage
+    private let background: NSImage
+    private(set) var selection: NSRect?
+    private(set) var canvas: AnnotationCanvas?
+    var onSelection: ((CaptureSelectionView) -> Void)?
+    var selectionTool = true
+    private var anchor = NSPoint.zero
+    private var previousRect: NSRect?
+    private var previousMarks = [CaptureMark]()
+    private var operation = 0 // new region, move, resize
+    private var edges = [false, false, false, false] // left, right, bottom, top
+
+    init(snapshot: CGImage, size: NSSize) {
+        self.snapshot = snapshot
+        background = NSImage(cgImage: snapshot, size: size)
+        super.init(frame: NSRect(origin: .zero, size: size))
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("截图选区：拖动框选，选区后可直接标注")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var acceptsFirstResponder: Bool { true }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
+    override func draw(_ dirtyRect: NSRect) {
+        background.draw(in: bounds)
+        NSColor.black.withAlphaComponent(0.42).setFill()
+        if let rect = selection, !rect.isEmpty {
+            NSRect(x: 0, y: 0, width: bounds.width, height: rect.minY).fill()
+            NSRect(x: 0, y: rect.maxY, width: bounds.width, height: bounds.height - rect.maxY).fill()
+            NSRect(x: 0, y: rect.minY, width: rect.minX, height: rect.height).fill()
+            NSRect(x: rect.maxX, y: rect.minY, width: bounds.width - rect.maxX, height: rect.height).fill()
+            NSColor.systemBlue.setStroke()
+            let border = NSBezierPath(rect: rect.insetBy(dx: -1, dy: -1)); border.lineWidth = 2; border.stroke()
+            NSColor.white.setFill()
+            for point in [NSPoint(x: rect.minX, y: rect.minY), NSPoint(x: rect.midX, y: rect.minY), NSPoint(x: rect.maxX, y: rect.minY),
+                          NSPoint(x: rect.minX, y: rect.maxY), NSPoint(x: rect.midX, y: rect.maxY), NSPoint(x: rect.maxX, y: rect.maxY),
+                          NSPoint(x: rect.minX, y: rect.midY), NSPoint(x: rect.maxX, y: rect.midY)] {
+                NSBezierPath(ovalIn: NSRect(x: point.x - 3, y: point.y - 3, width: 6, height: 6)).fill()
+            }
+            let pixels = capturePixelRect(rect, viewSize: bounds.size, pixelSize: NSSize(width: snapshot.width, height: snapshot.height))
+            let label = "\(Int(pixels.width)) × \(Int(pixels.height))"
+            (label as NSString).draw(at: NSPoint(x: rect.minX + 6, y: min(bounds.maxY - 20, rect.maxY + 6)),
+                                    withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: NSColor.white])
+        } else { bounds.fill() }
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        for view in subviews.reversed() where view !== canvas {
+            if !view.isHidden, let hit = view.hitTest(point) { return hit }
+        }
+        if let rect = selection, rect.insetBy(dx: -7, dy: -7).contains(point), !rect.insetBy(dx: 7, dy: 7).contains(point) { return self }
+        if selectionTool { return bounds.contains(point) ? self : nil }
+        return super.hitTest(point)
+    }
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        anchor = convert(event.locationInWindow, from: nil)
+        previousRect = selection; previousMarks = canvas?.marks ?? []
+        operation = 0
+        if let rect = selection, rect.insetBy(dx: -7, dy: -7).contains(anchor) {
+            edges = [abs(anchor.x - rect.minX) < 7, abs(anchor.x - rect.maxX) < 7, abs(anchor.y - rect.minY) < 7, abs(anchor.y - rect.maxY) < 7]
+            operation = edges.contains(true) ? 2 : 1
+        }
+        if operation == 0 { selection = NSRect(origin: anchor, size: .zero); previousMarks = [] }
+        canvas?.isHidden = true
+        needsDisplay = true
+    }
+    override func mouseDragged(with event: NSEvent) {
+        var point = convert(event.locationInWindow, from: nil)
+        point.x = min(bounds.maxX, max(0, point.x)); point.y = min(bounds.maxY, max(0, point.y))
+        if operation == 1, let old = previousRect {
+            selection = NSRect(x: min(bounds.maxX - old.width, max(0, old.minX + point.x - anchor.x)),
+                               y: min(bounds.maxY - old.height, max(0, old.minY + point.y - anchor.y)), width: old.width, height: old.height)
+        } else if operation == 2, let old = previousRect {
+            let x1 = edges[0] ? min(point.x, old.maxX - 8) : old.minX
+            let x2 = edges[1] ? max(point.x, old.minX + 8) : old.maxX
+            let y1 = edges[2] ? min(point.y, old.maxY - 8) : old.minY
+            let y2 = edges[3] ? max(point.y, old.minY + 8) : old.maxY
+            selection = NSRect(x: x1, y: y1, width: x2 - x1, height: y2 - y1)
+        } else {
+            selection = NSRect(x: min(anchor.x, point.x), y: min(anchor.y, point.y), width: abs(point.x - anchor.x), height: abs(point.y - anchor.y))
+        }
+        needsDisplay = true
+    }
+    override func mouseUp(with event: NSEvent) {
+        guard let rect = selection, rect.width >= 8, rect.height >= 8, let image = selectedImage() else {
+            selection = previousRect; canvas?.isHidden = false; needsDisplay = true; return
+        }
+        canvas?.removeFromSuperview()
+        var marks = previousMarks
+        if operation != 0, let old = previousRect {
+            marks = marks.map { mark in
+                CaptureMark(tool: mark.tool, color: mark.color, stroke: mark.stroke * old.width / rect.width,
+                    points: mark.points.map { NSPoint(x: (old.minX + $0.x * old.width - rect.minX) / rect.width,
+                                                     y: (old.minY + $0.y * old.height - rect.minY) / rect.height) }, text: mark.text)
+            }
+        }
+        let canvas = AnnotationCanvas(image: image, marks: marks, padding: 0)
+        canvas.frame = rect
+        addSubview(canvas); self.canvas = canvas
+        needsDisplay = true
+        onSelection?(self)
+    }
+    func selectedImage() -> NSImage? {
+        guard let rect = selection else { return nil }
+        let pixels = capturePixelRect(rect, viewSize: bounds.size, pixelSize: NSSize(width: snapshot.width, height: snapshot.height))
+        guard !pixels.isEmpty, let crop = snapshot.cropping(to: pixels) else { return nil }
+        return captureBitmapImage(crop, logicalSize: rect.size)
+    }
+    func discardSelection() {
+        canvas?.removeFromSuperview(); canvas = nil; selection = nil; previousRect = nil; previousMarks = []
+        needsDisplay = true
+    }
+}
+
+private final class CaptureOverlayController {
+    var onComplete: ((NSImage, [CaptureMark], NSImage?) -> Void)?
+    var onCancel: (() -> Void)?
+    private var windows = [CaptureOverlayWindow]()
+    private var views = [CaptureSelectionView]()
+    private var active: CaptureSelectionView?
+    private let toolbar = CaptureHUDView(frame: NSRect(x: 0, y: 0, width: 890, height: 46))
+    private let infoPanel = CaptureHUDView(frame: NSRect(x: 0, y: 0, width: 330, height: 440))
+    private let tools = NSSegmentedControl(labels: ["选区", "画笔", "矩形", "圆圈", "箭头", "文字"], trackingMode: .selectOne, target: nil, action: nil)
+    private let colors = NSSegmentedControl(labels: ["红", "橙", "蓝", "绿", "黑", "白"], trackingMode: .selectOne, target: nil, action: nil)
+    private let width = NSSlider(value: 3, minValue: 1, maxValue: 10, target: nil, action: nil)
+    private let undo = NSButton(title: "撤销", target: nil, action: nil)
+    private let clear = NSButton(title: "清空", target: nil, action: nil)
+    private let complete = NSButton(title: "完成", target: nil, action: nil)
+    private var finishing = false
+
+    init(snapshots: [(NSScreen, CGImage)], context: [String: Any]) {
+        for (screen, image) in snapshots {
+            let window = CaptureOverlayWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.level = .screenSaver
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            window.isOpaque = true; window.backgroundColor = .black
+            let view = CaptureSelectionView(snapshot: image, size: screen.frame.size)
+            view.onSelection = { [weak self] view in self?.selected(view) }
+            window.contentView = view
+            window.onCancel = { [weak self] in self?.cancel() }
+            window.onComplete = { [weak self] in self?.finish() }
+            window.onUndo = { [weak self] in self?.undoMark() }
+            windows.append(window); views.append(view)
+        }
+        toolbar.headerHeight = 0
+        toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 8; toolbar.layer?.masksToBounds = true
+        tools.selectedSegment = 0; tools.target = self; tools.action = #selector(changeTool)
+        colors.selectedSegment = 0; colors.target = self; colors.action = #selector(changeColor)
+        width.target = self; width.action = #selector(changeWidth); width.setAccessibilityLabel("画笔粗细")
+        width.widthAnchor.constraint(equalToConstant: 76).isActive = true
+        undo.target = self; undo.action = #selector(undoMark); undo.keyEquivalent = "z"; undo.keyEquivalentModifierMask = .command
+        clear.target = self; clear.action = #selector(clearMarks)
+        complete.target = self; complete.action = #selector(finish)
+        let cancel = NSButton(title: "取消", target: self, action: #selector(cancel))
+        let ax = NSButton(title: "AX 信息", target: self, action: #selector(toggleInfo))
+        for button in [undo, clear, complete, cancel, ax] { button.bezelStyle = .rounded }
+        let stack = NSStackView(views: [tools, colors, width, undo, clear, ax, cancel, complete])
+        stack.spacing = 8; stack.orientation = .horizontal; stack.translatesAutoresizingMaskIntoConstraints = false
+        toolbar.addSubview(stack)
+        do {
+            let content = toolbar
+            NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+                stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+                stack.centerYAnchor.constraint(equalTo: content.centerYAnchor)])
+        }
+        infoPanel.title = "前景窗口 · AX 信息"
+        infoPanel.wantsLayer = true; infoPanel.layer?.cornerRadius = 8; infoPanel.layer?.masksToBounds = true
+        let hideInfo = NSButton(title: "×", target: self, action: #selector(toggleInfo))
+        hideInfo.frame = NSRect(x: 302, y: 413, width: 20, height: 20)
+        hideInfo.bezelStyle = .inline; hideInfo.setAccessibilityLabel("收起 AX 信息")
+        infoPanel.addSubview(hideInfo)
+        let info = NSTextView(); info.isEditable = false; info.isRichText = false
+        info.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        info.textContainerInset = NSSize(width: 14, height: 14)
+        info.isVerticallyResizable = true; info.autoresizingMask = [.width]; info.textContainer?.widthTracksTextView = true
+        info.setAccessibilityLabel("本次前景窗口无障碍树")
+        let app = context["app"] as? [String: Any] ?? [:]
+        let window = context["window"] as? [String: Any] ?? [:]
+        let axInfo = context["accessibility"] as? [String: Any] ?? [:]
+        let nodes = axInfo["nodes"] as? [[String: Any]] ?? []
+        var lines = ["按快捷键时的前景窗口快照", "范围可能大于截图选区", "", app["name"] as? String ?? "未知应用",
+                     window["title"] as? String ?? "未读取到窗口标题", window["url"] as? String ?? "未读取到页面 URL", "",
+                     "AX 状态：\(axInfo["status"] as? String ?? "unavailable") · \(nodes.count) 个节点" + ((axInfo["truncated"] as? Bool == true) ? "（已截断）" : ""), ""]
+        if nodes.isEmpty { lines.append("未采集到节点。请核对辅助功能授权与助手菜单中的 AX 开关。") }
+        for node in nodes {
+            let depth = min(16, node["depth"] as? Int ?? 0)
+            let role = node["role"] as? String ?? "AXElement"
+            let text = ["title", "text", "description", "url"].compactMap { node[$0] as? String }.filter { !$0.isEmpty }.joined(separator: " · ")
+            lines.append(String(repeating: "  ", count: depth) + role + (text.isEmpty ? "" : "  " + text))
+        }
+        lines.append("\n拖动框选 → 在选区直接标注 → 完成\nEnter 完成 · Escape 取消 · ⌘Z 撤销")
+        info.string = lines.joined(separator: "\n")
+        let scroll = NSScrollView(); scroll.documentView = info; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        scroll.frame = NSRect(x: 1, y: 1, width: 328, height: 406)
+        infoPanel.addSubview(scroll)
+        setControls(enabled: false)
+    }
+    private func setControls(enabled: Bool) {
+        for index in 1..<tools.segmentCount { tools.setEnabled(enabled, forSegment: index) }
+        colors.isEnabled = enabled; width.isEnabled = enabled; undo.isEnabled = enabled; clear.isEnabled = enabled; complete.isEnabled = enabled
+    }
+    func present() {
+        NSApp.activate(ignoringOtherApps: true)
+        for window in windows { window.orderFrontRegardless() }
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main
+        let target = windows.first(where: { $0.screen == screen }) ?? windows.first
+        target?.makeKeyAndOrderFront(nil)
+        if let view = target?.contentView {
+            attachHUDs(to: view)
+            infoPanel.setFrameOrigin(NSPoint(x: view.bounds.maxX - 346, y: view.bounds.maxY - 468))
+            toolbar.setFrameOrigin(NSPoint(x: max(8, view.bounds.midX - 445), y: 18))
+        }
+    }
+    private func attachHUDs(to view: NSView) {
+        toolbar.removeFromSuperview(); infoPanel.removeFromSuperview()
+        view.addSubview(toolbar); view.addSubview(infoPanel)
+    }
+    private func selected(_ view: CaptureSelectionView) {
+        for other in views where other !== view { other.discardSelection() }
+        active = view; setControls(enabled: true)
+        applyTool()
+        guard let rect = view.selection else { return }
+        let movedScreen = toolbar.superview !== view
+        attachHUDs(to: view)
+        if movedScreen { infoPanel.setFrameOrigin(NSPoint(x: view.bounds.maxX - 346, y: view.bounds.maxY - 468)) }
+        let y = rect.minY - 56 >= 0 ? rect.minY - 56 : min(view.bounds.maxY - 52, rect.maxY + 10)
+        toolbar.setFrameOrigin(NSPoint(x: max(8, min(rect.minX, view.bounds.maxX - toolbar.frame.width - 8)), y: y))
+    }
+    private func applyTool() {
+        for view in views { view.selectionTool = tools.selectedSegment == 0 }
+        active?.canvas?.tool = max(0, tools.selectedSegment - 1)
+        changeColor(); changeWidth()
+    }
+    @objc private func changeTool() { applyTool(); active?.window?.makeFirstResponder(active?.canvas) }
+    @objc private func changeColor() { active?.canvas?.ink = [NSColor.systemRed, .systemOrange, .systemBlue, .systemGreen, .black, .white][colors.selectedSegment] }
+    @objc private func changeWidth() { active?.canvas?.stroke = CGFloat(width.doubleValue) }
+    @objc private func undoMark() { active?.canvas?.undoMark(nil) }
+    @objc private func clearMarks() { active?.canvas?.clearMarks(nil) }
+    @objc private func toggleInfo() { infoPanel.isHidden.toggle() }
+    @objc func cancel() { guard !finishing else { return }; finishing = true; close(); onCancel?() }
+    @objc private func finish() {
+        guard !finishing, let view = active, let image = view.selectedImage(), let canvas = view.canvas else { return }
+        do {
+            let annotated = canvas.marks.isEmpty ? nil : try canvas.renderedImage()
+            finishing = true; close(); onComplete?(image, canvas.marks, annotated)
+        } catch {
+            let alert = NSAlert(); alert.messageText = "截图未能导出"; alert.informativeText = error.localizedDescription
+            alert.window.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 4); alert.runModal()
+        }
+    }
+    func close() { toolbar.removeFromSuperview(); infoPanel.removeFromSuperview(); for window in windows { window.orderOut(nil); window.close() } }
+}
+
+@available(macOS 14.0, *)
+private func captureDisplaySnapshots(_ completion: @escaping (Result<[(NSScreen, CGImage)], Error>) -> Void) {
+    let screens = NSScreen.screens
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+        DispatchQueue.main.async {
+            guard let content else {
+                completion(.failure(error ?? NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "无法读取显示器列表。"])))
+                return
+            }
+            var snapshots = [(NSScreen, CGImage)]()
+            func next(_ index: Int) {
+                if index >= screens.count { completion(.success(snapshots)); return }
+                let screen = screens[index]
+                let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+                guard let display = content.displays.first(where: { $0.displayID == id }) else {
+                    completion(.failure(NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "显示器已断开，请重新截图。"])))
+                    return
+                }
+                let config = SCStreamConfiguration()
+                // Quartz display dimensions may be in logical points on Retina
+                // displays. Match AppKit backing pixels to avoid downsampling.
+                config.width = Int((screen.frame.width * screen.backingScaleFactor).rounded())
+                config.height = Int((screen.frame.height * screen.backingScaleFactor).rounded())
+                config.showsCursor = false
+                SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: display, excludingWindows: []), configuration: config) { image, error in
+                    DispatchQueue.main.async {
+                        guard let image else {
+                            completion(.failure(error ?? NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "读取屏幕图像失败。"])))
+                            return
+                        }
+                        snapshots.append((screen, image)); next(index + 1)
+                    }
+                }
+            }
+            next(0)
+        }
+    }
+}
+
 private final class CaptureInputController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
     var onSubmit: ((String) -> Void)?
     var onCancel: (() -> Void)?
     private let textView = NSTextView()
+    private let preview = NSImageView()
+    private var originalImage: NSImage
+    private var marks = [CaptureMark]()
+    private var annotatedImage: NSImage?
+    private var annotationEditor: AnnotationController?
+    private let annotateButton = NSButton(title: "标注截图…", target: nil, action: nil)
     private let spinner = NSProgressIndicator()
     private let statusIcon = NSImageView()
     private let projectLabel = NSTextField(labelWithString: RecognitionProgress.identifying.title)
@@ -247,23 +867,58 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
     private let messageLabel = NSTextField(wrappingLabelWithString: "⌘ Return 开始任务 · Return 换行")
     private let startButton = NSButton(title: "开始任务", target: nil, action: nil)
     private let cancelButton = NSButton(title: "取消", target: nil, action: nil)
+    private let debugButton = NSButton(title: "Luna 调试 ▸", target: nil, action: nil)
+    private let debugPanel = NSView()
+    private let requestText = NSTextView()
+    private let responseText = NSTextView()
+    private var debugWidth: NSLayoutConstraint!
+    private var debugBodyWidth: NSLayoutConstraint!
+    private var debugSnapshot: Data?
+    private var debugExpanded = false
     private var progress = RecognitionProgress.identifying
     private var submitting = false
     private var cancellable = true
     private var dismissed = false
 
     init(image: NSImage) {
-        let window = CaptureInputWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 530), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        originalImage = image
+        let window = CaptureInputWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 560), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Codex Capture"
         window.isReleasedWhenClosed = false
+        window.level = .normal
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         super.init(window: window)
         window.delegate = self
         window.onEscape = { [weak self] in self?.cancelInput(nil) }
         window.onSubmit = { [weak self] in self?.submitInput(nil) }
 
+        let root = NSView()
+        window.contentView = root
         let content = NSView()
-        window.contentView = content
-        let preview = NSImageView()
+        let debugContainer = NSView()
+        debugContainer.wantsLayer = true
+        debugContainer.layer?.masksToBounds = true
+        debugPanel.translatesAutoresizingMaskIntoConstraints = false
+        debugContainer.addSubview(debugPanel)
+        for item in [content, debugContainer] {
+            item.translatesAutoresizingMaskIntoConstraints = false
+            root.addSubview(item)
+        }
+        debugWidth = debugContainer.widthAnchor.constraint(equalToConstant: 0)
+        debugBodyWidth = debugPanel.widthAnchor.constraint(equalToConstant: 480)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            content.topAnchor.constraint(equalTo: root.topAnchor),
+            content.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            content.trailingAnchor.constraint(equalTo: debugContainer.leadingAnchor),
+            debugContainer.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            debugContainer.topAnchor.constraint(equalTo: root.topAnchor),
+            debugContainer.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            debugPanel.leadingAnchor.constraint(equalTo: debugContainer.leadingAnchor),
+            debugPanel.topAnchor.constraint(equalTo: debugContainer.topAnchor),
+            debugPanel.bottomAnchor.constraint(equalTo: debugContainer.bottomAnchor),
+            debugWidth, debugBodyWidth,
+        ])
         preview.image = image; preview.imageScaling = .scaleProportionallyUpOrDown
         // A large screenshot must fit this window, never enlarge it to the
         // image's intrinsic pixel size (multi-display captures can be huge).
@@ -334,7 +989,65 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
         let buttons = NSStackView(views: [cancelButton, startButton])
         buttons.orientation = .horizontal; buttons.spacing = 8
 
-        for item in [preview, recognition, heading, editor, messageLabel, buttons] {
+        debugButton.bezelStyle = .inline
+        debugButton.target = self; debugButton.action = #selector(toggleDebug)
+        let debugTitle = NSTextField(labelWithString: "Luna")
+        debugTitle.font = .systemFont(ofSize: 15, weight: .semibold)
+        let divider = NSBox(); divider.boxType = .separator
+        let requestLabel = NSTextField(labelWithString: "Request body")
+        let responseLabel = NSTextField(labelWithString: "Response body")
+        for label in [requestLabel, responseLabel] {
+            label.font = .systemFont(ofSize: 12, weight: .semibold)
+            label.textColor = .secondaryLabelColor
+        }
+        func codeView(_ text: NSTextView, label: String) -> NSScrollView {
+            text.isEditable = false; text.isRichText = false
+            text.isAutomaticQuoteSubstitutionEnabled = false
+            text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            text.textContainerInset = NSSize(width: 12, height: 10)
+            text.isVerticallyResizable = true
+            text.isHorizontallyResizable = false
+            text.autoresizingMask = [.width]
+            text.textContainer?.widthTracksTextView = true
+            text.string = label == "Request body" ? "等待请求…" : "等待响应…"
+            text.setAccessibilityLabel(label)
+            let scroll = NSScrollView()
+            scroll.documentView = text
+            scroll.hasVerticalScroller = true
+            scroll.autohidesScrollers = true
+            scroll.wantsLayer = true
+            scroll.layer?.cornerRadius = 7
+            scroll.layer?.masksToBounds = true
+            return scroll
+        }
+        let requestScroll = codeView(requestText, label: "Request body")
+        let responseScroll = codeView(responseText, label: "Response body")
+        debugPanel.isHidden = true
+        for item in [divider, debugTitle, requestLabel, requestScroll, responseLabel, responseScroll] {
+            item.translatesAutoresizingMaskIntoConstraints = false
+            debugPanel.addSubview(item)
+        }
+        NSLayoutConstraint.activate([
+            divider.leadingAnchor.constraint(equalTo: debugPanel.leadingAnchor),
+            divider.topAnchor.constraint(equalTo: debugPanel.topAnchor, constant: 18),
+            divider.bottomAnchor.constraint(equalTo: debugPanel.bottomAnchor, constant: -18),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            debugTitle.topAnchor.constraint(equalTo: debugPanel.topAnchor, constant: 20),
+            debugTitle.leadingAnchor.constraint(equalTo: debugPanel.leadingAnchor, constant: 20),
+            requestLabel.topAnchor.constraint(equalTo: debugTitle.bottomAnchor, constant: 16),
+            requestLabel.leadingAnchor.constraint(equalTo: debugTitle.leadingAnchor),
+            requestScroll.topAnchor.constraint(equalTo: requestLabel.bottomAnchor, constant: 7),
+            requestScroll.leadingAnchor.constraint(equalTo: debugTitle.leadingAnchor),
+            requestScroll.trailingAnchor.constraint(equalTo: debugPanel.trailingAnchor, constant: -20),
+            responseLabel.topAnchor.constraint(equalTo: requestScroll.bottomAnchor, constant: 16),
+            responseLabel.leadingAnchor.constraint(equalTo: debugTitle.leadingAnchor),
+            responseScroll.topAnchor.constraint(equalTo: responseLabel.bottomAnchor, constant: 7),
+            responseScroll.leadingAnchor.constraint(equalTo: debugTitle.leadingAnchor),
+            responseScroll.trailingAnchor.constraint(equalTo: requestScroll.trailingAnchor),
+            responseScroll.bottomAnchor.constraint(equalTo: debugPanel.bottomAnchor, constant: -20),
+            requestScroll.heightAnchor.constraint(equalTo: responseScroll.heightAnchor),
+        ])
+        for item in [preview, recognition, heading, editor, messageLabel, debugButton, buttons] {
             item.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(item)
         }
         NSLayoutConstraint.activate([
@@ -356,9 +1069,18 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
             messageLabel.leadingAnchor.constraint(equalTo: preview.leadingAnchor),
             messageLabel.trailingAnchor.constraint(equalTo: preview.trailingAnchor),
             messageLabel.heightAnchor.constraint(equalToConstant: 28),
+            debugButton.topAnchor.constraint(equalTo: messageLabel.bottomAnchor, constant: 2),
+            debugButton.leadingAnchor.constraint(equalTo: preview.leadingAnchor),
             buttons.topAnchor.constraint(equalTo: messageLabel.bottomAnchor, constant: 10),
             buttons.trailingAnchor.constraint(equalTo: preview.trailingAnchor),
             buttons.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -18),
+        ])
+        annotateButton.bezelStyle = .rounded
+        annotateButton.target = self; annotateButton.action = #selector(editAnnotation)
+        annotateButton.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(annotateButton)
+        NSLayoutConstraint.activate([
+            annotateButton.topAnchor.constraint(equalTo: preview.topAnchor, constant: 8),
+            annotateButton.trailingAnchor.constraint(equalTo: preview.trailingAnchor, constant: -8),
         ])
         window.initialFirstResponder = textView
         window.center()
@@ -371,7 +1093,94 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
         NSApp.activate(ignoringOtherApps: true)
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+        window?.orderFrontRegardless()
         window?.makeFirstResponder(textView)
+    }
+
+    @objc private func toggleDebug() {
+        debugExpanded.toggle()
+        debugButton.title = debugExpanded ? "Luna 调试 ▾" : "Luna 调试 ▸"
+        debugPanel.isHidden = !debugExpanded
+        guard let window else { return }
+        let screen = window.screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let sidebarWidth = min(480, max(300, screen.width - 620))
+        debugBodyWidth.constant = sidebarWidth
+        debugWidth.constant = debugExpanded ? sidebarWidth : 0
+        var frame = window.frame
+        frame.size.width = 620 + debugWidth.constant
+        frame.origin.x = min(frame.origin.x, screen.maxX - frame.width)
+        frame.origin.x = max(screen.minX, frame.origin.x)
+        window.setFrame(frame, display: true)
+    }
+
+    func updateDebug(directory: URL) {
+        let url = directory.appendingPathComponent("classification-debug.json")
+        guard let data = try? Data(contentsOf: url), data.count <= 4_194_304, data != debugSnapshot,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        debugSnapshot = data
+        updateDebugBodies(object)
+    }
+
+    func updateDebugBodies(_ object: [String: Any]) {
+        var request: [String: Any] = [:]
+        var response: [String: Any] = [:]
+        request["thread/start"] = object["threadRequest"]
+        request["turn/start"] = object["turnRequest"]
+        response["thread/start"] = object["threadResponse"]
+        response["turn/completed"] = object["turnResponse"]
+        response["error"] = object["error"]
+        for (textView, body) in [(requestText, request), (responseText, response)] {
+            guard !body.isEmpty,
+                  let data = try? JSONSerialization.data(withJSONObject: body, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+                  let text = String(data: data, encoding: .utf8), text != textView.string else { continue }
+            let selection = textView.selectedRange()
+            let origin = textView.enclosingScrollView?.contentView.bounds.origin
+            textView.textStorage?.setAttributedString(highlightedJSON(text))
+            textView.setSelectedRange(NSRange(location: min(selection.location, textView.string.utf16.count), length: 0))
+            if let origin, let scroll = textView.enclosingScrollView {
+                scroll.contentView.scroll(to: origin)
+                scroll.reflectScrolledClipView(scroll.contentView)
+            }
+        }
+    }
+
+    @objc private func editAnnotation() {
+        guard !submitting, let window, window.attachedSheet == nil else { return }
+        let editor = AnnotationController(image: originalImage, marks: marks)
+        editor.onApply = { [weak self] marks, image in
+            guard let self else { return }
+            self.applyAnnotations(marks, image: image)
+        }
+        annotationEditor = editor
+        if let sheet = editor.window { window.beginSheet(sheet) }
+    }
+
+    func applyAnnotations(_ marks: [CaptureMark], image: NSImage?) {
+        self.marks = marks; self.annotatedImage = image
+        preview.image = image ?? originalImage
+        annotateButton.title = marks.isEmpty ? "标注截图…" : "已标注 · 编辑…"
+    }
+
+    func closeAnnotationEditor() { annotationEditor?.cancelEditor(); annotationEditor = nil }
+
+    func writeAnnotatedImage(to url: URL) throws -> Bool {
+        guard let annotatedImage, let bitmap = annotatedImage.representations.first as? NSBitmapImageRep,
+              let data = bitmap.representation(using: .png, properties: [:]) else { return false }
+        try data.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        return true
+    }
+
+    func replaceScreenshot(_ image: NSImage) {
+        closeAnnotationEditor()
+        originalImage = image; annotatedImage = nil; marks = []
+        annotateButton.title = "标注截图…"
+        preview.image = image
+        debugSnapshot = nil
+        requestText.string = "等待请求…"
+        responseText.string = "等待响应…"
+        setSubmitting(false)
+        updateRecognition(.identifying)
     }
 
     func updateRecognition(_ value: RecognitionProgress) {
@@ -389,6 +1198,7 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
 
     func setSubmitting(_ value: Bool, awaitingPreparation: Bool = false) {
         submitting = value
+        annotateButton.isEnabled = !value
         cancellable = !value || awaitingPreparation
         messageLabel.stringValue = value ? (awaitingPreparation ? "正在准备项目识别，随后开始任务…" : "正在创建任务…") : "⌘ Return 开始任务 · Return 换行"
         messageLabel.textColor = .secondaryLabelColor
@@ -404,6 +1214,7 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
     }
 
     func dismiss() {
+        closeAnnotationEditor()
         dismissed = true
         window?.orderOut(nil)
         close()
@@ -566,11 +1377,14 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
     private var menuIsOpen = false
     private var screenCapturePermission = ScreenCapturePermissionState()
     private var inputSession: CaptureInputSession?
+    private var captureOverlay: CaptureOverlayController?
+    private var selectingScreenshot = false
     private let startedAt = timestamp()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let duplicate = NSRunningApplication.runningApplications(withBundleIdentifier: appID).contains { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
         if duplicate { NSApp.terminate(nil); return }
+        UserDefaults.standard.register(defaults: [axPreference: true])
         ownsStatusRecord = true
         screenCapturePermission.refresh(using: CGPreflightScreenCaptureAccess)
         try? FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -601,6 +1415,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        captureOverlay?.close()
         if let inputSession { cancelInputSession(inputSession) }
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
@@ -638,7 +1453,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         menu.delegate = self
         let title = hotKeyStatus == noErr ? "截图并开始任务（⌥S）" : "截图并开始任务（快捷键不可用）"
         let capture = menu.addItem(withTitle: title, action: #selector(captureFromMenu), keyEquivalent: "")
-        capture.target = self; capture.isEnabled = !busy
+        capture.target = self; capture.isEnabled = !busy || canReplaceCapture
         let progressText = state == "permission_required" ? "屏幕录制待授权；请打开下方权限设置" : activeJobs.isEmpty ? "没有进行中的任务" : "\(activeJobs.count) 个任务进行中：" + activeJobs[0].label
         let progress = menu.addItem(withTitle: busy ? "正在截图或提交…" : progressText, action: nil, keyEquivalent: "")
         progress.isEnabled = false
@@ -760,13 +1575,18 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         refreshMenu(); writeStatus()
     }
 
+    private var canReplaceCapture: Bool {
+        !selectingScreenshot && state == "awaiting_description" && inputSession != nil && inputSession?.submissionInFlight == false
+    }
+
     fileprivate func beginCapture() {
-        guard !busy else { return }
+        guard !selectingScreenshot, !busy || canReplaceCapture else { return }
         if let lastTrigger, Date().timeIntervalSince(lastTrigger) < 0.4 { return }
         lastTrigger = Date(); lastError = nil
         guard FileManager.default.isExecutableFile(atPath: launcherURL.path) else {
             alert("尚未安装任务入口", "请重新运行插件的 install.sh。\n" + launcherURL.path); return
         }
+        selectingScreenshot = true
         busy = true; state = "capturing"; refreshMenu(); writeStatus()
         // Capture source identity before any permission dialog, screen selection,
         // or our text input window can become the foreground application.
@@ -784,6 +1604,43 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         do { try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
         catch { fail(error, temporary: nil); return }
         let screenshot = temporary.appendingPathComponent("screenshot.png")
+        inputSession?.controller.closeAnnotationEditor()
+        inputSession?.controller.window?.orderOut(nil)
+        if #available(macOS 14.0, *) {
+            captureDisplaySnapshots { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .failure(let error): self.fail(error, temporary: temporary)
+                case .success(let snapshots):
+                    guard !snapshots.isEmpty else {
+                        self.fail(NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "没有可用的显示器。"]), temporary: temporary)
+                        return
+                    }
+                    let overlay = CaptureOverlayController(snapshots: snapshots, context: context)
+                    self.captureOverlay = overlay
+                    overlay.onCancel = { [weak self] in
+                        guard let self else { return }
+                        self.captureOverlay = nil; self.state = "ready"; self.finishCapture(temporary: temporary)
+                        if self.inputSession == nil { _ = source?.activate(options: []) }
+                    }
+                    overlay.onComplete = { [weak self] image, marks, annotated in
+                        guard let self else { return }
+                        self.captureOverlay = nil
+                        do {
+                            guard let bitmap = image.representations.first as? NSBitmapImageRep,
+                                  let data = bitmap.representation(using: .png, properties: [:]) else {
+                                throw NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "无法保存截图。"])
+                            }
+                            try data.write(to: screenshot, options: .atomic)
+                            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: screenshot.path)
+                            self.askDescription(screenshot: screenshot, context: context, temporary: temporary, marks: marks, annotated: annotated)
+                        } catch { self.fail(error, temporary: temporary) }
+                    }
+                    overlay.present()
+                }
+            }
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let result = try command("/usr/sbin/screencapture", ["-i", "-x", screenshot.path], timeout: 180)
@@ -804,7 +1661,8 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         }
     }
 
-    private func askDescription(screenshot: URL, context: [String: Any], temporary: URL) {
+    private func askDescription(screenshot: URL, context: [String: Any], temporary: URL, marks: [CaptureMark] = [], annotated: NSImage? = nil) {
+        selectingScreenshot = false
         guard let image = NSImage(contentsOf: screenshot) else {
             fail(NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "无法读取本次截图，请重新截图。"]), temporary: temporary)
             return
@@ -812,7 +1670,15 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         let contextFile = temporary.appendingPathComponent("context.json")
         do { try writeJSON(context, to: contextFile) }
         catch { fail(error, temporary: temporary); return }
-        let controller = CaptureInputController(image: image)
+        let controller: CaptureInputController
+        if let previous = inputSession {
+            controller = previous.controller
+            cancelInputSession(previous, dismissWindow: false)
+            controller.replaceScreenshot(image)
+        } else {
+            controller = CaptureInputController(image: image)
+        }
+        controller.applyAnnotations(marks, image: annotated)
         let session = CaptureInputSession(controller: controller, temporary: temporary)
         inputSession = session
         controller.onSubmit = { [weak self, weak session] text in
@@ -906,6 +1772,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
             }
             return
         }
+        session.controller.updateDebug(directory: stateURL.deletingLastPathComponent())
         var progress = RecognitionProgress(state: record)
         if progress.loading, let pid = record["workerPid"] as? Int ?? session.preparationWorkerPID,
            pid <= 1 || pid > Int(Int32.max) || kill(pid_t(pid), 0) != 0 {
@@ -936,12 +1803,21 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
     private func submitPreparedSession(_ session: CaptureInputSession) {
         guard inputSession === session, !session.cancelled, !session.submissionInFlight,
               let preparationID = session.preparationID, let text = session.pendingDescription else { return }
+        let annotatedURL = session.temporary.appendingPathComponent("annotated.png")
+        let annotationPath: String?
+        do { annotationPath = try session.controller.writeAnnotatedImage(to: annotatedURL) ? annotatedURL.path : nil }
+        catch {
+            session.pendingDescription = nil
+            session.controller.showSubmissionError("无法保存标注图。" + error.localizedDescription)
+            state = "awaiting_description"; writeStatus()
+            return
+        }
         session.submissionInFlight = true
         session.pollTimer?.invalidate(); session.pollTimer = nil
         session.controller.setSubmitting(true)
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let result = try command(launcherURL.path, submissionArguments(preparationID: preparationID, text: text), timeout: 30)
+                let result = try command(launcherURL.path, submissionArguments(preparationID: preparationID, text: text, annotatedImage: annotationPath), timeout: 30)
                 DispatchQueue.main.async {
                     guard self.inputSession === session, !session.cancelled else { return }
                     session.submissionInFlight = false
@@ -998,17 +1874,21 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         }
     }
 
-    private func cancelInputSession(_ session: CaptureInputSession) {
+    private func cancelInputSession(_ session: CaptureInputSession, dismissWindow: Bool = true) {
         guard inputSession === session, !session.submissionInFlight else { return }
         session.cancelled = true
         session.pollTimer?.invalidate(); session.pollTimer = nil
-        session.controller.dismiss()
+        if dismissWindow { session.controller.dismiss() }
         if let preparationID = session.preparationID { discardPreparation(preparationID) }
         inputSession = nil
         state = "ready"
         // prepare may still be copying these inputs. Its completion callback
         // owns cleanup until the command has returned, even after this closes.
-        finishCapture(temporary: session.preparationReturned ? session.temporary : nil)
+        if dismissWindow {
+            finishCapture(temporary: session.preparationReturned ? session.temporary : nil)
+        } else if session.preparationReturned {
+            try? FileManager.default.removeItem(at: session.temporary)
+        }
     }
 
     private func fail(_ error: Error, temporary: URL?) {
@@ -1017,8 +1897,16 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         finishCapture(temporary: temporary)
     }
     private func finishCapture(temporary: URL? = nil) {
+        selectingScreenshot = false
         if let temporary { try? FileManager.default.removeItem(at: temporary) }
-        busy = false; refreshMenu(); writeStatus()
+        if let inputSession {
+            state = "awaiting_description"
+            busy = true
+            inputSession.controller.present()
+        } else {
+            busy = false
+        }
+        refreshMenu(); writeStatus()
     }
 }
 
@@ -1026,6 +1914,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
 /// menu-bar delegate, reads another application, or invokes a model/launcher.
 private final class CapturePreviewDelegate: NSObject, NSApplicationDelegate {
     private var controller: CaptureInputController?
+    private var overlay: CaptureOverlayController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let image = NSImage(size: NSSize(width: 960, height: 540))
@@ -1056,8 +1945,42 @@ private final class CapturePreviewDelegate: NSObject, NSApplicationDelegate {
             label(text, x: 265, y: y - 2, size: 19)
         }
         image.unlockFocus()
+        if CommandLine.arguments.contains("--preview-capture"), let screen = NSScreen.main,
+           let bitmap = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            let context: [String: Any] = [
+                "app": ["name": "Demo Browser"],
+                "window": ["title": "Demo Notes · 合成截图", "url": "https://demo.invalid/#/notes/fixture"],
+                "accessibility": ["status": "captured", "nodes": [
+                    ["role": "AXWindow", "depth": 0, "title": "Demo Notes"],
+                    ["role": "AXWebArea", "depth": 1, "url": "https://demo.invalid/#/notes/fixture"],
+                    ["role": "AXHeading", "depth": 2, "title": "旅行清单"],
+                    ["role": "AXStaticText", "depth": 2, "text": "确认车票和住宿"],
+                ]],
+            ]
+            let overlay = CaptureOverlayController(snapshots: [(screen, bitmap)], context: context)
+            self.overlay = overlay
+            overlay.onCancel = { NSApp.terminate(nil) }
+            overlay.onComplete = { [weak self] image, marks, annotated in
+                let controller = CaptureInputController(image: image)
+                controller.applyAnnotations(marks, image: annotated)
+                self?.controller = controller; self?.overlay = nil
+                controller.onCancel = { controller.dismiss(); NSApp.terminate(nil) }
+                controller.onSubmit = { _ in controller.showSubmissionError("这是界面预览，不会创建任务。") }
+                controller.updateRecognition(RecognitionProgress(state: ["phase": "ready", "project": ["name": "Demo Notes"]]))
+                controller.present()
+            }
+            overlay.present()
+            return
+        }
         let controller = CaptureInputController(image: image)
         self.controller = controller
+        controller.updateDebugBodies([
+            "threadRequest": ["model": "gpt-6-luna", "ephemeral": true, "sandbox": "read-only"],
+            "turnRequest": ["input": [["type": "text", "text": "识别 Demo Notes 截图所属项目。"],
+                                      ["type": "localImage", "path": "/tmp/synthetic-preview.png"]], "effort": "low"],
+            "turnResponse": ["status": "completed", "elapsedSeconds": 1.25,
+                             "finalText": "{\"projectId\":\"demo-notes\",\"confidence\":0.99}"],
+        ])
         controller.onCancel = { controller.dismiss(); NSApp.terminate(nil) }
         controller.onSubmit = { _ in controller.showSubmissionError("这是界面预览，不会创建任务。") }
         controller.present()
@@ -1069,7 +1992,70 @@ private final class CapturePreviewDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-if CommandLine.arguments.contains("--self-test") {
+if CommandLine.arguments.contains("--probe-screens") {
+    if #available(macOS 14.0, *) {
+        _ = NSApplication.shared
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
+            fputs("Screen snapshot diagnostic timed out.\n", stderr); exit(1)
+        }
+        captureDisplaySnapshots { result in
+            switch result {
+            case .success(let images):
+                let summary = images.map { screen, image in ["pixelsWide": image.width, "pixelsHigh": image.height,
+                                                            "logicalWidth": Int(screen.frame.width), "logicalHeight": Int(screen.frame.height)] }
+                if let data = try? JSONSerialization.data(withJSONObject: ["snapshots": summary], options: [.sortedKeys]) {
+                    print(String(data: data, encoding: .utf8)!)
+                }
+                exit(images.isEmpty ? 1 : 0)
+            case .failure(let error): fputs((error.localizedDescription + "\n"), stderr); exit(1)
+            }
+        }
+        RunLoop.main.run()
+    } else { fputs("Screen snapshot diagnostic requires macOS 14.\n", stderr); exit(2) }
+} else if let flag = CommandLine.arguments.firstIndex(of: "--probe-context") {
+    guard CommandLine.arguments.indices.contains(flag + 1) else {
+        fputs("Usage: CodexCapture --probe-context <application-bundle-id>\n", stderr)
+        exit(2)
+    }
+    let bundleID = CommandLine.arguments[flag + 1]
+    guard let source = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else {
+        fputs("Requested application is not running.\n", stderr)
+        exit(2)
+    }
+    // Exercise the exact screenshot-time reader without opening a window,
+    // capturing pixels, requesting permission, or invoking a model.
+    let context = foregroundContext(source, includeAX: true)
+    let data = try JSONSerialization.data(withJSONObject: context, options: [.prettyPrinted, .sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+} else if CommandLine.arguments.contains("--self-test") {
+    precondition(capturePixelRect(NSRect(x: 10, y: 20, width: 30, height: 40), viewSize: NSSize(width: 100, height: 100), pixelSize: NSSize(width: 200, height: 200)) == NSRect(x: 20, y: 80, width: 60, height: 80))
+    precondition(capturePixelRect(NSRect(x: -10, y: -10, width: 30, height: 30), viewSize: NSSize(width: 100, height: 100), pixelSize: NSSize(width: 200, height: 200)) == NSRect(x: 0, y: 160, width: 40, height: 40))
+    precondition(capturePixelRect(NSRect(x: 120, y: 120, width: 10, height: 10), viewSize: NSSize(width: 100, height: 100), pixelSize: NSSize(width: 200, height: 200)).isEmpty)
+    // Bitmap-only fixture: verify annotation export dimensions, actual painted
+    // pixels, original preservation, and undo when reopening saved marks.
+    let sourceBitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 64, pixelsHigh: 32,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    for x in 0..<64 { for y in 0..<32 { sourceBitmap.setColor(NSColor(deviceRed: 1, green: 1, blue: 1, alpha: 1), atX: x, y: y) } }
+    let sourceImage = NSImage(size: NSSize(width: 64, height: 32)); sourceImage.addRepresentation(sourceBitmap)
+    let cropPixels = capturePixelRect(NSRect(x: 8, y: 4, width: 24, height: 16), viewSize: sourceImage.size, pixelSize: NSSize(width: 64, height: 32))
+    let cropImage = captureBitmapImage(sourceBitmap.cgImage!.cropping(to: cropPixels)!, logicalSize: NSSize(width: 24, height: 16))
+    precondition(cropImage.representations.first is NSBitmapImageRep)
+    let cropBitmap = cropImage.representations.first as! NSBitmapImageRep
+    precondition(cropBitmap.pixelsWide == 24 && cropBitmap.pixelsHigh == 16)
+    precondition(cropBitmap.representation(using: .png, properties: [:]) != nil)
+    let fixtureMark = CaptureMark(tool: 1, color: NSColor(deviceRed: 1, green: 0, blue: 0, alpha: 1), stroke: 0.04, points: [NSPoint(x: 0.1, y: 0.2), NSPoint(x: 0.9, y: 0.8)])
+    let fixtureCanvas = AnnotationCanvas(image: sourceImage, marks: [fixtureMark])
+    let rendered = try fixtureCanvas.renderedImage()
+    let outputBitmap = rendered.representations[0] as! NSBitmapImageRep
+    let png = outputBitmap.representation(using: .png, properties: [:])!
+    let decoded = NSBitmapImageRep(data: png)!
+    precondition(decoded.pixelsWide == 64 && decoded.pixelsHigh == 32)
+    let painted = decoded.colorAt(x: 6, y: 16)!.usingColorSpace(.deviceRGB)!
+    precondition(painted.redComponent > 0.8 && painted.greenComponent < 0.2)
+    precondition(sourceBitmap.colorAt(x: 6, y: 16)!.usingColorSpace(.deviceRGB)!.greenComponent > 0.9)
+    fixtureCanvas.undoMark(nil); precondition(fixtureCanvas.marks.isEmpty)
+    fixtureCanvas.marks = [fixtureMark]; fixtureCanvas.clearMarks(nil); precondition(fixtureCanvas.marks.isEmpty)
+    fixtureCanvas.undoMark(nil); precondition(fixtureCanvas.marks.count == 1)
     var permission = ScreenCapturePermissionState()
     var permissionRequests = 0
     let deniedRequest = { permissionRequests += 1; return false }
@@ -1111,6 +2097,7 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(safeURL("https://user:password@example.com/project?token=secret#fragment") == "https://example.com/project")
     precondition(safeURL("javascript:alert(1)") == nil)
     precondition(safeURL("https://example.com/a") == "https://example.com/a")
+    precondition(safeURL("https://user:password@example.com/?token=secret#/daily/fixture?token=secret") == "https://example.com/#/daily/fixture")
     precondition(jobPhaseLabel("classifying") == "Luna 判断项目")
     precondition(jobPhaseLabel("starting_followup") == "自动跟进")
     precondition(!JobSummary(id: "fixture", phase: "completed", project: "Demo", createdAt: "").active)
@@ -1143,7 +2130,7 @@ if CommandLine.arguments.contains("--self-test") {
     }
     let data = try JSONSerialization.data(withJSONObject: status, options: [.sortedKeys])
     print(String(data: data, encoding: .utf8)!)
-} else if CommandLine.arguments.contains("--preview-input") {
+} else if CommandLine.arguments.contains("--preview-input") || CommandLine.arguments.contains("--preview-capture") {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
     let delegate = CapturePreviewDelegate()

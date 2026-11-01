@@ -8,13 +8,16 @@
 | --- | --- |
 | 独立分类、新 chat、原图、一次跟进 | tests/test_capture.py 的协议与任务生命周期测试；实际账户验收按文末步骤执行 |
 | 截图后提前分类、输入期间并行、提交等待并复用同一次结果 | tests/test_preparation.py；原生助手 --self-test；真实 Luna 延迟需账户验收 |
-| 预识别取消、重复提交、分类进程退出与项目变化 | tests/test_preparation.py；取消输入不应创建正式 chat |
-| 输入窗口截图预览、识别 loading 与项目名 | Swift --preview-input / --preview-loading 使用合成图片检查；不截屏、不调用模型 |
+| 预识别取消、重复提交、分类进程退出、项目变化及分类服务连接复用 | tests/test_preparation.py；取消输入不应创建正式 chat |
+| 输入窗口截图预览、识别 loading 与项目名、首次置前与右侧折叠调试区 | Swift --preview-input / --preview-loading 使用合成图片检查；不截屏、不调用模型 |
 | 正式任务 Full access 与权限不符时停止 | tests/test_capture.py；实际运行核对 state.permissions 与 turn_context |
-| 首条消息原文原图、AX 仅用于分类 | tests/test_capture.py；Swift --self-test |
+| 首条消息原文原图与可选标注副本、AX 仅用于分类 | tests/test_capture.py；Swift --self-test |
 | 首轮文件变化判断、已有脏文件不误判、一次条件跟进 | tests/test_capture.py 的临时 Git 仓库与调度测试 |
 | 跟进发送与跳过原因、预设原文展示 | web 阶段单测及浏览器测试 |
-| 前景上下文边界与持久化 | tests/test_capture.py；授权后的真实 AX 采集仍由用户触发 |
+| 默认模型与跟进设置的保存、验证、权限、CLI 优先级和历史隔离 | tests/test_preparation.py、tests/test_gui.py；web 设置页浏览器测试 |
+| 截图浮层选区、直接圈选、文字、AX 面板、完成后带入输入窗口；再次编辑 | 原生助手 --preview-capture 合成截图手动操作；不读取其他应用或创建真实任务 |
+| 选区像素坐标转换（含 Retina 与边界裁剪）、PNG 尺寸、实际绘制、原图保留、撤销与清空 | Swift --self-test 的 64×32 合成位图；tests/test_capture.py 的原图和标注双附件验证 |
+| 前景上下文边界、URL hash 路由与持久化 | tests/test_capture.py；授权后的真实 AX 采集仍由用户触发 |
 | 历史列表、搜索、状态和项目筛选、分页 | tests/test_gui.py；web 浏览器测试 |
 | 旧记录读取、损坏记录、后台退出显示中断 | tests/test_gui.py；web 阶段状态单测 |
 | 原始图片鉴权、详情、日志与诊断导出 | tests/test_gui.py；web 浏览器测试 |
@@ -43,7 +46,7 @@ pnpm test:browser
 
 浏览器测试启动独立的浏览器进程，不使用个人浏览器资料。`CAPTURE_BROWSER_CHANNEL=chrome` 使用本机 Chrome；省略后使用 Playwright 已安装的 Chromium。安装包携带构建产物，最终安装时会校验缓存与源码一致。
 
-原生输入窗口可在编译助手后运行 `CodexCapture --preview-input` 查看合成截图及模拟识别结果，或加 `--preview-loading` 保持识别中的状态。预览不注册热键、不读取任务数据，也不请求系统权限；它验证布局和交互，不代表真实模型识别已验收。
+原生输入窗口可在编译助手后运行 `CodexCapture --preview-input` 查看合成截图及模拟识别结果，或加 `--preview-loading` 保持识别中的状态。`--preview-capture` 使用同一合成图片和虚构 AX 树，验证选区浮层与侧栏；完成后进入合成需求窗口。预览不注册热键、不读取任务数据，也不请求系统权限；它验证布局和交互，不代表真实模型识别已验收。
 
 本机签名身份完成初始化后，可显式运行不同构建的签名互验：
 

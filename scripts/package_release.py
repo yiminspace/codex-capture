@@ -34,7 +34,7 @@ PRIVATE_PARTS = {
     "task-state", "logs", "signing", ".codex", ".config", ".ssh", ".aws",
 }
 PRIVATE_NAMES = {
-    "followup.txt", "request.json", "state.json", "context.json", "route.json",
+    "settings.json", "classification-debug.json", "followup.txt", "request.json", "state.json", "context.json", "route.json",
     "diagnostics.json", "submission.json", "gui-server.json", "gui-endpoint.json",
     "installation.json", "hotkey-status.json", "auth.json", "identity.json", "setup-pending.json", "trust-pending.json", "keychain-password", "id_rsa", "id_ed25519",
 }
