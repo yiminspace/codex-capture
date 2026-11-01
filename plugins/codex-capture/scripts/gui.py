@@ -5,6 +5,7 @@ import collections
 import datetime as dt
 import errno
 import fcntl
+import hashlib
 import hmac
 import json
 import mimetypes
@@ -22,6 +23,9 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 VERSION = "0.4.3"
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
+# Capture the bytes loaded by this process, rather than hashing changed files
+# in a health request from an old process after an editable source update.
+RUNTIME_FINGERPRINT = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("capture.py").read_bytes()).hexdigest()
 TERMINAL = {"completed", "failed", "cancelled", "needs_input", "interrupted"}
 PHASE_LABELS = {
     "queued": "等待开始", "connecting": "连接 Codex", "classifying": "判断项目",
@@ -390,7 +394,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
             path = unquote(parsed.path)
             self.validate(api=path.startswith("/api/"))
             if path == "/api/health":
-                return self.send_json(200, {"ok": True, "version": self.server.version, "protocolVersion": 1, "pid": os.getpid(), "dataDirectory": str(self.server.store.root), "webRoot": str(self.server.web_root), "assetsAvailable": (self.server.web_root / "index.html").is_file()})
+                return self.send_json(200, {"ok": True, "version": self.server.version, "protocolVersion": 1, "pid": os.getpid(), "dataDirectory": str(self.server.store.root), "webRoot": str(self.server.web_root), "runtimeFingerprint": RUNTIME_FINGERPRINT, "assetsAvailable": (self.server.web_root / "index.html").is_file()})
             if path == "/api/system":
                 return self.send_json(200, self.server.store.system())
             if path == "/api/jobs":
@@ -498,7 +502,7 @@ def record_is_live(record, data_directory=None, web_root=None):
 def compatible_health(health, web_root=None):
     if not health or health.get("version") != VERSION or health.get("assetsAvailable") is not True:
         return False
-    return web_root is None or health.get("webRoot") == str(Path(web_root).resolve())
+    return web_root is None or (health.get("webRoot") == str(Path(web_root).resolve()) and health.get("runtimeFingerprint") == RUNTIME_FINGERPRINT)
 
 
 def endpoint_from(record):

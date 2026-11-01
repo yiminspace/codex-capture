@@ -21,11 +21,41 @@ INSTALL = next(block for block in BLOCKS if 'screen_capture_reset = None' in blo
 RESET_NODE = next(node for node in ast.parse(INSTALL).body
                   if isinstance(node, ast.If) and "signingMigrationRequired" in ast.get_source_segment(INSTALL, node.test))
 RESET = ast.get_source_segment(INSTALL, RESET_NODE)
+REFRESH = INSTALL[INSTALL.index('# A cache upgrade'):INSTALL.index('\nrecord = {')]
 APP_ID = 'com.yiminlab.codex-capture'
 
 
 class SigningFailure(RuntimeError):
     pass
+
+
+class RuntimeSelectionTests(unittest.TestCase):
+    def test_runtime_selection_is_published_before_gui_restart_in_both_directions(self):
+        for editable in ('0', '1'):
+            with self.subTest(editable=editable), tempfile.TemporaryDirectory(prefix='capture-install-runtime-') as tmp:
+                data = Path(tmp)
+                runtime = data / ('source' if editable == '1' else 'cache')
+                path = data / 'installation.json'
+                path.write_text(json.dumps({'installMode': 'cached' if editable == '1' else 'editable', 'runtimePath': 'previous', 'retained': 'metadata'}))
+                observed = []
+                gui = types.ModuleType('gui')
+                gui.read_object = lambda _path: {}
+                gui.server_health = lambda _record, _root: True
+
+                def launch(_data, open_browser):
+                    observed.append(json.loads(path.read_text()))
+                    return {'pid': 123, 'port': 54321}
+
+                gui.launch = launch
+                environment = {'data': data, 'root': str(data / 'repository'), 'runtime': runtime,
+                               'editable': editable, 'json': json, 'sys': types.SimpleNamespace(path=[])}
+                with mock.patch.dict(sys.modules, {'gui': gui}):
+                    exec(compile(REFRESH, 'installer-refresh-fixture', 'exec'), environment)
+                self.assertEqual(len(observed), 1)
+                self.assertEqual(observed[0]['installMode'], 'editable' if editable == '1' else 'cached')
+                self.assertEqual(observed[0]['runtimePath'], str(runtime))
+                self.assertEqual(observed[0]['retained'], 'metadata')
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
 class InstallerSigningTests(unittest.TestCase):

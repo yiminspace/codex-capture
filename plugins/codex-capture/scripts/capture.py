@@ -1208,8 +1208,31 @@ def main():
         gui.serve(DATA)
 
 
+def use_editable_runtime():
+    """Keep direct cached-plugin invocations on the selected source checkout too."""
+    try:
+        installation = read_json(DATA / "installation.json")
+    except (OSError, ValueError):
+        return
+    if installation.get("installMode") != "editable":
+        return
+    root = installation.get("sourceRoot")
+    runtime = installation.get("runtimePath")
+    if not isinstance(root, str) or not isinstance(runtime, str):
+        raise ValueError("editable 安装记录不完整，请重新运行 ./install.sh --editable。")
+    expected = Path(root).resolve() / "plugins/codex-capture"
+    if Path(runtime).resolve() != expected:
+        raise ValueError("editable 源码目录不匹配，请重新运行 ./install.sh --editable。")
+    script = expected / "scripts/capture.py"
+    if not script.is_file():
+        raise ValueError("editable 源码已移动或删除，请从有效仓库重新安装。")
+    if script.resolve() != Path(__file__).resolve():
+        os.execv(sys.executable, [sys.executable, str(script), *sys.argv[1:]])
+
+
 if __name__ == "__main__":
     try:
+        use_editable_runtime()
         main()
     except Exception as error:
         print(type(error).__name__ + ": " + str(error), file=sys.stderr)

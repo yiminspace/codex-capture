@@ -2,16 +2,19 @@
 set -euo pipefail
 
 capture_launch=1
-case "${1:-}" in
-  "") ;;
+capture_editable=0
+while [ "$#" -gt 0 ]; do
+case "$1" in
+  --editable) capture_editable=1; shift ;;
   --no-launch) capture_launch=0; shift ;;
   -h|--help)
-    echo 'Usage: ./install.sh [--no-launch]'
+    echo 'Usage: ./install.sh [--editable] [--no-launch]'
     echo 'Install the plugin and macOS Option+S helper; --no-launch leaves the helper stopped.'
+    echo '--editable runs Python and built web assets directly from this checkout.'
     exit 0 ;;
   *) echo "Unknown option: $1" >&2; exit 2 ;;
 esac
-if [ "$#" -ne 0 ]; then echo 'Unexpected arguments.' >&2; exit 2; fi
+done
 
 capture_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 capture_python="$(command -v python3)"
@@ -156,7 +159,7 @@ fi
 "$capture_codex" plugin marketplace add "$capture_root" --json > "$capture_tmp/marketplace.json"
 "$capture_codex" plugin add codex-capture@codex-capture-local --json > "$capture_tmp/install.json"
 
-"$capture_python" - "$capture_root" "$capture_python" "$capture_codex" "$capture_tmp/install.json" "$capture_app" "$capture_launch" "$capture_tmp/native-plan.json" <<'PY'
+"$capture_python" - "$capture_root" "$capture_python" "$capture_codex" "$capture_tmp/install.json" "$capture_app" "$capture_launch" "$capture_tmp/native-plan.json" "$capture_editable" <<'PY'
 import datetime
 import hashlib
 import json
@@ -170,7 +173,7 @@ import subprocess
 import sys
 import time
 
-root, python, codex, response_path, built_app, should_launch, native_plan_path = sys.argv[1:]
+root, python, codex, response_path, built_app, should_launch, native_plan_path, editable = sys.argv[1:]
 source = pathlib.Path(root) / 'plugins/codex-capture'
 sys.path.insert(0, str(pathlib.Path(root) / 'scripts'))
 import native_signing
@@ -215,6 +218,7 @@ for candidate in candidates:
         continue
 if installed is None:
     raise SystemExit('CLI 未返回可验证的插件安装目录；未创建快捷入口。')
+runtime = source.resolve() if editable == '1' else installed
 
 hashes = {}
 for path in sorted(source.rglob('*')):
@@ -239,7 +243,7 @@ launcher_text = '\n'.join([
     'export PATH=' + shlex.quote(str(pathlib.Path(codex).parent) + ':' + str(pathlib.Path(python).parent)) + ':"${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"',
     'if [ -z "${CODEX_CAPTURE_CODEX_BIN+x}" ]; then export CODEX_CAPTURE_CODEX_BIN=' + shlex.quote(codex) + '; fi',
     'if [ -z "${CODEX_CAPTURE_DATA+x}" ]; then export CODEX_CAPTURE_DATA=' + shlex.quote(str(data)) + '; fi',
-    'exec ' + shlex.quote(python) + ' ' + shlex.quote(str(installed / 'scripts/capture.py')) + ' "$@"',
+    'exec ' + shlex.quote(python) + ' ' + shlex.quote(str(runtime / 'scripts/capture.py')) + ' "$@"',
     '',
 ])
 alias_text = '\n'.join([
@@ -413,7 +417,25 @@ if should_launch == '1':
 # A cache upgrade may remove the old GUI's static assets while leaving its
 # process alive. Refresh an already-running workbench from this installation;
 # gui.launch preserves its endpoint and only replaces the authenticated GUI.
-sys.path.insert(0, str(installed / 'scripts'))
+def write_installation(record):
+    path = data / 'installation.json'
+    temporary = path.with_suffix('.json.installing')
+    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + '\n')
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+# Cached entry points consult this record before starting Python. Publish the
+# new selection before gui.launch spawns a replacement, including when leaving
+# editable mode; otherwise the old selection redirects it to the wrong tree.
+try:
+    selection = json.loads((data / 'installation.json').read_text())
+except (OSError, ValueError):
+    selection = {}
+if not isinstance(selection, dict):
+    selection = {}
+selection.update(sourceRoot=root, installMode='editable' if editable == '1' else 'cached', runtimePath=str(runtime))
+write_installation(selection)
+sys.path.insert(0, str(runtime / 'scripts'))
 import gui
 gui_status = None
 if gui.server_health(gui.read_object(data / 'gui-server.json'), data):
@@ -425,6 +447,8 @@ record = {
     'installedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
     'sourceRoot': root,
     'installedPath': str(installed),
+    'installMode': 'editable' if editable == '1' else 'cached',
+    'runtimePath': str(runtime),
     'launcher': str(launcher),
     'commandAlias': str(command_alias),
     'finderLauncher': str(finder),
@@ -444,7 +468,7 @@ record = {
     'codexVersion': subprocess.check_output([codex, '--version'], text=True).strip(),
     'sha256': hashes,
 }
-(data / 'installation.json').write_text(json.dumps(record, ensure_ascii=False, indent=2) + '\n')
+write_installation(record)
 print(json.dumps(record, ensure_ascii=False, indent=2))
 if should_launch == '1' and hotkey_status.get('registered') is not True:
     raise SystemExit('插件已安装，但 Option+S 未注册成功；请查看 hotkeyStatus/lastError。助手菜单仍可截图。')
