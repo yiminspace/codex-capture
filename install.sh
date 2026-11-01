@@ -60,8 +60,22 @@ for path in paths:
         if path.is_symlink() or not path.is_file() or '# codex-capture managed launcher v1' not in path.read_text():
             raise SystemExit(f'已有非本插件入口，未覆盖：{path}')
 
-# Reuse signed native bytes for Python/web-only updates. Re-signing an otherwise
-# unchanged ad-hoc helper changes its identity and can invalidate macOS grants.
+# Keep a machine-local signing identity across native rebuilds, separate from
+# task data. Its dedicated keychain is registered without changing trust stores.
+sys.path.insert(0, str(root / 'scripts'))
+import native_signing
+previous_app = pathlib.Path.home() / '.local/share/codex-capture/Codex Capture.app'
+if previous_app.exists() or previous_app.is_symlink():
+    if previous_app.is_symlink():
+        raise SystemExit('已有助手路径是符号链接，未初始化或替换签名身份。')
+    previous_info = plistlib.loads((previous_app / 'Contents/Info.plist').read_bytes())
+    if previous_info.get('CFBundleIdentifier') != native_signing.APP_ID or previous_info.get('CodexCaptureManaged') is not True:
+        raise SystemExit('已有应用不属于此安装器，未初始化或替换签名身份。')
+signing = native_signing.ensure(identity=os.environ.get('CODEX_CAPTURE_SIGNING_IDENTITY'),
+                               previous_app=previous_app if previous_app.exists() else None)
+
+# Reuse verified native bytes for Python/web-only updates; old ad-hoc builds
+# must migrate once even if their source files have not changed.
 source = root / 'plugins/codex-capture'
 native_files = ('native/CaptureApp.swift', 'native/Info.plist')
 native_hashes = {name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in native_files}
@@ -78,7 +92,7 @@ def bundle_fingerprint(bundle):
             result[str(path.relative_to(bundle))] = hashlib.sha256(path.read_bytes()).hexdigest()
     return result
 
-plan = {'reuse': False, 'helperVersion': native_info['CFBundleShortVersionString'], 'sourceHashes': native_hashes}
+plan = {'reuse': False, 'helperVersion': native_info['CFBundleShortVersionString'], 'sourceHashes': native_hashes, 'signing': signing}
 try:
     previous = json.loads((data / 'installation.json').read_text())
     existing_info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
@@ -96,8 +110,9 @@ try:
         legacy_version = previous.get('helperVersion') or (previous.get('hotkeyStatus') or {}).get('version')
         matching_bundle = fingerprint == recorded if recorded is not None else legacy_version == plan['helperVersion']
         if signature.returncode == 0 and matching_bundle:
+            native_signing.verify(app, signing)
             plan.update(reuse=True, bundleFingerprint=fingerprint)
-except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, native_signing.SigningError):
     pass  # First install, changed native code or unverified bytes: build anew.
 temporary = pathlib.Path(sys.argv[3])
 (temporary / 'native-plan.json').write_text(json.dumps(plan))
@@ -105,7 +120,7 @@ if plan['reuse']:
     (temporary / 'reuse-native').touch()
 PY
 
-# Build before touching an existing installation. No prompts or capture occur here.
+# Build and verify the new identity before touching an existing installation.
 if [ "$(uname -s)" != Darwin ]; then
   echo 'The Option+S helper currently requires macOS.' >&2
   exit 1
@@ -118,8 +133,24 @@ if [ ! -f "$capture_tmp/reuse-native" ]; then
     -framework AppKit -framework Carbon -framework ApplicationServices \
     "$capture_root/plugins/codex-capture/native/CaptureApp.swift" \
     -o "$capture_app/Contents/MacOS/CodexCapture"
-  /usr/bin/codesign --force --sign - "$capture_app"
-  /usr/bin/codesign --verify --strict "$capture_app"
+  capture_sign_args=(sign --app "$capture_app")
+  capture_previous_app="$HOME/.local/share/codex-capture/Codex Capture.app"
+  if [ -d "$capture_previous_app" ]; then
+    capture_sign_args+=(--previous-app "$capture_previous_app")
+  fi
+  "$capture_python" "$capture_root/scripts/native_signing.py" "${capture_sign_args[@]}" > "$capture_tmp/native-signing.json"
+  "$capture_python" - "$capture_tmp/native-plan.json" "$capture_tmp/native-signing.json" <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+plan = json.loads(path.read_text())
+signed = json.loads(pathlib.Path(sys.argv[2]).read_text())
+if signed['identitySHA1'] != plan['signing']['identitySHA1'] or signed['designatedRequirement'] != plan['signing']['designatedRequirement']:
+    raise SystemExit('签名身份在构建期间发生变化；保留已有助手。')
+plan['signingMigrationRequired'] = signed.get('migrationRequired', False)
+path.write_text(json.dumps(plan))
+PY
 fi
 
 "$capture_codex" plugin marketplace add "$capture_root" --json > "$capture_tmp/marketplace.json"
@@ -141,6 +172,8 @@ import time
 
 root, python, codex, response_path, built_app, should_launch, native_plan_path = sys.argv[1:]
 source = pathlib.Path(root) / 'plugins/codex-capture'
+sys.path.insert(0, str(pathlib.Path(root) / 'scripts'))
+import native_signing
 response = json.loads(pathlib.Path(response_path).read_text())
 native_plan = json.loads(pathlib.Path(native_plan_path).read_text())
 helper_version = native_plan['helperVersion']
@@ -268,6 +301,16 @@ try:
         previous_pid = candidate_pid
 except (OSError, ValueError, TypeError):
     pass
+
+# Validate the installed-location copy before interrupting the current helper.
+staged = app.with_name(app.name + '.installing')
+backup = app.with_name(app.name + '.previous')
+if staged.exists() or backup.exists():
+    raise SystemExit('发现未完成的 app 安装；保留旧文件，请检查 .installing/.previous 后重试。')
+if not native_plan['reuse']:
+    shutil.copytree(built_app, staged)
+    native_signing.verify(staged, native_plan['signing'])
+
 running = subprocess.run(['/bin/launchctl', 'print', service], capture_output=True)
 if running.returncode == 0:
     subprocess.run(['/bin/launchctl', 'bootout', service], check=True)
@@ -286,12 +329,7 @@ if previous_pid:
         else:
             raise SystemExit('旧助手未退出，保留 app 未替换。请退出 Codex Capture 后重试。')
 
-staged = app.with_name(app.name + '.installing')
-backup = app.with_name(app.name + '.previous')
-if staged.exists() or backup.exists():
-    raise SystemExit('发现未完成的 app 安装；保留旧文件，请检查 .installing/.previous 后重试。')
 if not native_plan['reuse']:
-    shutil.copytree(built_app, staged)
     try:
         if app.exists():
             app.rename(backup)
@@ -302,6 +340,18 @@ if not native_plan['reuse']:
         raise
     if backup.exists():
         shutil.rmtree(backup)
+
+# Only the one-time migration from a verified ad-hoc helper clears its obsolete
+# screen grant. Ordinary rebuilds keep the certificate and never reset TCC.
+screen_capture_reset = None
+if native_plan.get('signingMigrationRequired'):
+    try:
+        reset = subprocess.run(['/usr/bin/tccutil', 'reset', 'ScreenCapture', label], capture_output=True, text=True, timeout=15)
+        screen_capture_reset = {'attempted': True, 'exitCode': reset.returncode}
+        if reset.returncode:
+            screen_capture_reset['error'] = reset.stderr.strip()[:500]
+    except (OSError, subprocess.TimeoutExpired):
+        screen_capture_reset = {'attempted': True, 'exitCode': None, 'error': '旧录屏授权未能自动清理；新助手仍会启动，请按系统提示处理。'}
 
 agent.parent.mkdir(parents=True, exist_ok=True)
 agent_info = {
@@ -383,6 +433,9 @@ record = {
     'hotkeyStatus': hotkey_status,
     'helperVersion': helper_version,
     'nativeReused': native_plan['reuse'],
+    'nativeSigning': native_plan['signing'],
+    'signingMigrationRequired': native_plan.get('signingMigrationRequired', False),
+    'screenCaptureReset': screen_capture_reset,
     'workbench': gui_status,
     'nativeSourceHashes': native_plan['sourceHashes'],
     'nativeAppFingerprint': bundle_fingerprint(app),

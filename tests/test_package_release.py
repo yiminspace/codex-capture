@@ -114,6 +114,20 @@ class ReleaseTests(unittest.TestCase):
         self.git("add", "-f", "notes.log")
         self.assert_rejected("runtime data or private file type")
 
+    def test_preparation_directory_is_private_even_for_plain_text(self):
+        self.write("preparations/fixture/result.txt", "private classification")
+        self.git("add", "preparations/fixture/result.txt")
+        self.assert_rejected("runtime data or private file type")
+
+    def test_local_signing_material_is_never_public_source(self):
+        for name in ('signing/public-note.txt', '.signing-bootstrap-fixture/result.txt', 'private.keychain-db',
+                     'keychain-password', 'identity.json', 'setup-pending.json', 'trust-pending.json', 'certificate.der'):
+            with self.subTest(name=name):
+                self.write(name, 'machine-local identity')
+                self.git('add', name)
+                self.assert_rejected('runtime data or private file type')
+                self.git('rm', '--cached', name)
+
     def test_unknown_plugin_file_is_rejected(self):
         name = release.PLUGIN + "unexpected.txt"
         self.write(name, "unreviewed file")
