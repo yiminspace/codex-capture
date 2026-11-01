@@ -813,15 +813,15 @@ private final class CaptureOverlayController {
 
 @available(macOS 14.0, *)
 private func captureDisplaySnapshots(_ completion: @escaping (Result<[(NSScreen, CGImage)], Error>) -> Void) {
-    let screens = NSScreen.screens
     SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
         DispatchQueue.main.async {
             guard let content else {
                 completion(.failure(error ?? NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "无法读取显示器列表。"])))
                 return
             }
+            let screens = NSScreen.screens
             var snapshots = [(NSScreen, CGImage)]()
-            func next(_ index: Int) {
+            @MainActor func next(_ index: Int) {
                 if index >= screens.count { completion(.success(snapshots)); return }
                 let screen = screens[index]
                 let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
