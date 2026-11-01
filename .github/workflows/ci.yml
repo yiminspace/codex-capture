@@ -49,6 +49,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Installer syntax
         run: bash -n install.sh
+      - name: Signing lifecycle tests without changing keychain trust
+        run: python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_native_signing.py' -v
       - name: Compile and self-test without UI
         run: |
           xcrun swiftc -warnings-as-errors \

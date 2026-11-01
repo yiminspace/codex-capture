@@ -7,6 +7,9 @@
 | 功能 | 证据 |
 | --- | --- |
 | 独立分类、新 chat、原图、一次跟进 | tests/test_capture.py 的协议与任务生命周期测试；实际账户验收按文末步骤执行 |
+| 截图后提前分类、输入期间并行、提交等待并复用同一次结果 | tests/test_preparation.py；原生助手 --self-test；真实 Luna 延迟需账户验收 |
+| 预识别取消、重复提交、分类进程退出与项目变化 | tests/test_preparation.py；取消输入不应创建正式 chat |
+| 输入窗口截图预览、识别 loading 与项目名 | Swift --preview-input / --preview-loading 使用合成图片检查；不截屏、不调用模型 |
 | 正式任务 Full access 与权限不符时停止 | tests/test_capture.py；实际运行核对 state.permissions 与 turn_context |
 | 首条消息原文原图、AX 仅用于分类 | tests/test_capture.py；Swift --self-test |
 | 首轮文件变化判断、已有脏文件不误判、一次条件跟进 | tests/test_capture.py 的临时 Git 仓库与调度测试 |
@@ -22,6 +25,8 @@
 | 本机鉴权、Origin/Host、路径和符号链接限制 | tests/test_gui.py |
 | GUI 服务独立启动、复用与协议兼容升级 | tests/test_gui.py 的隔离真实 HTTP 服务测试 |
 | 菜单栏工作台入口、阶段缓存和中断显示 | Swift 严格编译及 --self-test；真实输入动作需要手动触发 |
+| 固定签名复用、身份不匹配时保留旧助手、普通更新不重置权限、签名材料不进入安装包 | tests/test_native_signing.py、tests/test_install_signing.py、发布边界测试 |
+| 不同原生构建满足同一签名要求 | macOS 上使用本机固定身份签名两份不同的合成程序，交叉验证 DR；真实录屏授权保留仍需迁移授权后的更新验收 |
 
 运行：
 
@@ -36,6 +41,17 @@ pnpm test:browser
 ```
 
 浏览器测试启动独立的浏览器进程，不使用个人浏览器资料。`CAPTURE_BROWSER_CHANNEL=chrome` 使用本机 Chrome；省略后使用 Playwright 已安装的 Chromium。安装包携带构建产物，最终安装时会校验缓存与源码一致。
+
+原生输入窗口可在编译助手后运行 `CodexCapture --preview-input` 查看合成截图及模拟识别结果，或加 `--preview-loading` 保持识别中的状态。预览不注册热键、不读取任务数据，也不请求系统权限；它验证布局和交互，不代表真实模型识别已验收。
+
+本机签名身份完成初始化后，可显式运行不同构建的签名互验：
+
+```sh
+CODEX_CAPTURE_TEST_SIGNING_STATE="$HOME/.local/share/codex-capture/signing" \
+  python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_native_signing.py' -v
+```
+
+该测试使用已有身份和两份合成程序，不创建证书、不修改信任或录屏权限、不替换真实助手。未设置变量时自动跳过真实签名检查，CI 仅运行隔离策略测试。首次初始化如果中断，重新运行安装器会续接同一份证书，不重新生成身份；新流程不要求添加证书信任。
 
 对真实任务的只读 GUI 验收应核对同一 job ID 下的描述、原图、项目、两个 turn、预设内容、错误及事件数量；不能把 fixture 截图或深链调用成功当作真实任务已正确显示的证据。
 

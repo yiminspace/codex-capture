@@ -18,7 +18,7 @@ import zipfile
 
 PLUGIN = "plugins/codex-capture/"
 PACKAGE_FILES = frozenset({
-    "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "install.sh",
+    "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "install.sh", "scripts/native_signing.py",
     ".agents/plugins/marketplace.json",
     PLUGIN + "LICENSE", PLUGIN + "plugin.json",
     PLUGIN + "native/CaptureApp.swift", PLUGIN + "native/Info.plist",
@@ -30,18 +30,18 @@ WEB_PREFIX = PLUGIN + "web/"
 WEB_ASSET = re.compile(re.escape(WEB_PREFIX) + r"assets/index-[A-Za-z0-9_-]+\.(?:js|css)")
 PRIVATE_PARTS = {
     ".git", ".local", "dist", "node_modules", ".venv", "__pycache__",
-    "test-results", "playwright-report", "jobs", "captures", "screenshots",
-    "task-state", "logs", ".codex", ".config", ".ssh", ".aws",
+    "test-results", "playwright-report", "jobs", "preparations", "captures", "screenshots",
+    "task-state", "logs", "signing", ".codex", ".config", ".ssh", ".aws",
 }
 PRIVATE_NAMES = {
     "followup.txt", "request.json", "state.json", "context.json", "route.json",
-    "diagnostics.json", "gui-server.json", "gui-endpoint.json",
-    "installation.json", "hotkey-status.json", "auth.json", "id_rsa", "id_ed25519",
+    "diagnostics.json", "submission.json", "gui-server.json", "gui-endpoint.json",
+    "installation.json", "hotkey-status.json", "auth.json", "identity.json", "setup-pending.json", "trust-pending.json", "keychain-password", "id_rsa", "id_ed25519",
 }
 PRIVATE_SUFFIXES = {
     ".log", ".jsonl", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic",
     ".tiff", ".bmp", ".sqlite", ".sqlite3", ".db", ".zip", ".gz", ".tgz",
-    ".har", ".map", ".pyc", ".pem", ".key", ".p12", ".pfx", ".bundle",
+    ".har", ".map", ".pyc", ".pem", ".key", ".p12", ".pfx", ".bundle", ".keychain", ".keychain-db", ".der",
 }
 HOME_PATH = re.compile(rb"/(?:Users|home)/([A-Za-z0-9_.-]+)/")
 EXAMPLE_USERS = {b"example", b"user", b"username", b"demo", b"test"}
@@ -139,6 +139,7 @@ def check_sources(root, followup_path=None):
         relative = PurePosixPath(name)
         basename = relative.name
         if (set(relative.parts) & PRIVATE_PARTS or basename in PRIVATE_NAMES
+                or any(part.startswith('.signing-bootstrap-') for part in relative.parts)
                 or basename.startswith("VALIDATION")
                 or (basename.startswith(".env") and basename != ".env.example")
                 or relative.suffix.lower() in PRIVATE_SUFFIXES):

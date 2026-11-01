@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codex-capture",
-  "version": "0.4.6",
+  "version": "0.5.1",
   "description": "Capture with Option+S, route tasks with Luna, and follow progress, history and diagnostics in a local Voyage workbench.",
   "extensions": {
     "com.openai": {
