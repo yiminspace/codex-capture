@@ -577,6 +577,11 @@ def wait_for_preparation(preparation_id, job_directory):
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
+                # Completion is published before the worker exits. The state
+                # read above may predate that final write, so check it again.
+                latest = read_json(directory / "state.json")
+                if latest.get("phase") not in ("queued", "connecting", "classifying"):
+                    continue  # Re-enter through cancellation and terminal checks.
                 raise NeedsInput("项目识别进程已退出，请重新截图。") from None
             with (directory / "worker.lock").open("a") as lock:
                 try:

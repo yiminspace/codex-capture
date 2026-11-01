@@ -893,16 +893,30 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
 
     private func pollPreparation(_ session: CaptureInputSession) {
         guard inputSession === session, !session.cancelled, !session.submissionInFlight, let stateURL = session.stateURL else { return }
-        guard let info = try? stateURL.resourceValues(forKeys: [.fileSizeKey, .isSymbolicLinkKey]),
-              info.isSymbolicLink != true, let size = info.fileSize, size <= 1_048_576,
-              let data = try? Data(contentsOf: stateURL),
-              let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        func readRecord() -> [String: Any]? {
+            guard let info = try? stateURL.resourceValues(forKeys: [.fileSizeKey, .isSymbolicLinkKey]),
+                  info.isSymbolicLink != true, let size = info.fileSize, size <= 1_048_576,
+                  let data = try? Data(contentsOf: stateURL),
+                  let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            return record
+        }
+        guard let record = readRecord() else {
             if Date().timeIntervalSince(session.startedAt) > 30 {
                 preparationFailed(session, message: "无法读取项目识别状态，请取消后重新截图。")
             }
             return
         }
-        let progress = RecognitionProgress(state: record)
+        var progress = RecognitionProgress(state: record)
+        if progress.loading, let pid = record["workerPid"] as? Int ?? session.preparationWorkerPID,
+           pid <= 1 || pid > Int(Int32.max) || kill(pid_t(pid), 0) != 0 {
+            // The worker writes its terminal state before exiting. Refresh the
+            // earlier loading snapshot before deciding that recognition failed.
+            if let latest = readRecord() { progress = RecognitionProgress(state: latest) }
+            if progress.loading {
+                preparationFailed(session, message: "项目识别进程已退出，请取消后重新截图。")
+                return
+            }
+        }
         session.controller.updateRecognition(progress)
         if !progress.loading {
             session.preparationFinished = true
@@ -912,9 +926,6 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                 session.controller.setSubmitting(false)
                 lastError = progress.detail; state = "awaiting_description"; writeStatus()
             }
-        } else if let pid = record["workerPid"] as? Int ?? session.preparationWorkerPID,
-                  pid <= 1 || pid > Int(Int32.max) || kill(pid_t(pid), 0) != 0 {
-            preparationFailed(session, message: "项目识别进程已退出，请取消后重新截图。")
         } else if record["workerPid"] == nil && session.preparationWorkerPID == nil && Date().timeIntervalSince(session.startedAt) > 10 {
             preparationFailed(session, message: "项目识别进程未能启动，请取消后重新截图。")
         } else if Date().timeIntervalSince(session.startedAt) > 300 {

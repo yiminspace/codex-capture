@@ -277,6 +277,45 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(capture.NeedsInput, "进程已退出"):
                 capture.wait_for_preparation(result["preparationId"], job_directory)
 
+    def test_wait_reloads_terminal_state_when_worker_finishes_before_liveness_check(self):
+        for phase in ("ready", "failed", "needs_input", "cancelled"):
+            with self.subTest(phase=phase):
+                result, _ = self.prepare()
+                directory = self.directory(result)
+                capture.atomic_json(directory / "state.json", {"phase": "classifying", "workerPid": 12345})
+                job_directory = self.root / ("waiting-job-" + phase)
+                job_directory.mkdir()
+                def finish_and_exit(_pid, _signal):
+                    capture.atomic_json(directory / "state.json", {"phase": phase, "workerPid": 12345, "error": "fixture terminal reason"})
+                    raise ProcessLookupError()
+                with mock.patch.object(capture.time, "monotonic", side_effect=[0, 0, 0, 6]), \
+                     mock.patch.object(capture.os, "kill", side_effect=finish_and_exit):
+                    if phase == "ready":
+                        returned_directory, state = capture.wait_for_preparation(result["preparationId"], job_directory)
+                        self.assertEqual(returned_directory, directory)
+                        self.assertEqual(state["phase"], "ready")
+                    else:
+                        expected = capture.Cancelled if phase == "cancelled" else capture.NeedsInput
+                        with self.assertRaisesRegex(expected, "fixture terminal reason"):
+                            capture.wait_for_preparation(result["preparationId"], job_directory)
+                self.assertFalse((directory / "cancel").exists())
+
+    def test_wait_checks_cancellation_before_accepting_newly_published_ready_state(self):
+        result, _ = self.prepare()
+        directory = self.directory(result)
+        capture.atomic_json(directory / "state.json", {"phase": "classifying", "workerPid": 12345})
+        job_directory = self.root / "cancelled-waiting-job"
+        job_directory.mkdir()
+        def finish_and_cancel(_pid, _signal):
+            capture.atomic_json(directory / "state.json", {"phase": "ready", "workerPid": 12345})
+            (job_directory / "cancel").touch()
+            raise ProcessLookupError()
+        with mock.patch.object(capture.time, "monotonic", side_effect=[0, 0, 0, 6]), \
+             mock.patch.object(capture.os, "kill", side_effect=finish_and_cancel):
+            with self.assertRaises(capture.Cancelled):
+                capture.wait_for_preparation(result["preparationId"], job_directory)
+        self.assertTrue((directory / "cancel").exists())
+
     def test_wait_timeout_cancels_classification(self):
         result, _ = self.prepare()
         job_directory = self.root / "waiting-job"
