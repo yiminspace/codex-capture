@@ -812,42 +812,59 @@ private final class CaptureOverlayController {
 }
 
 @available(macOS 14.0, *)
-private func captureDisplaySnapshots(_ completion: @escaping (Result<[(NSScreen, CGImage)], Error>) -> Void) {
-    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
-        DispatchQueue.main.async {
-            guard let content else {
-                completion(.failure(error ?? NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "无法读取显示器列表。"])))
-                return
-            }
-            let screens = NSScreen.screens
-            var snapshots = [(NSScreen, CGImage)]()
-            @MainActor func next(_ index: Int) {
-                if index >= screens.count { completion(.success(snapshots)); return }
-                let screen = screens[index]
-                let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-                guard let display = content.displays.first(where: { $0.displayID == id }) else {
-                    completion(.failure(NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "显示器已断开，请重新截图。"])))
+@MainActor
+private final class DisplaySnapshotReader {
+    private var screens = [NSScreen]()
+    private var displays = [SCDisplay]()
+    private var snapshots = [(NSScreen, CGImage)]()
+    private let completion: (Result<[(NSScreen, CGImage)], Error>) -> Void
+
+    init(completion: @escaping (Result<[(NSScreen, CGImage)], Error>) -> Void) { self.completion = completion }
+
+    func start() {
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+            DispatchQueue.main.async {
+                guard let content else {
+                    self.completion(.failure(error ?? NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "无法读取显示器列表。"])))
                     return
                 }
-                let config = SCStreamConfiguration()
-                // Quartz display dimensions may be in logical points on Retina
-                // displays. Match AppKit backing pixels to avoid downsampling.
-                config.width = Int((screen.frame.width * screen.backingScaleFactor).rounded())
-                config.height = Int((screen.frame.height * screen.backingScaleFactor).rounded())
-                config.showsCursor = false
-                SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: display, excludingWindows: []), configuration: config) { image, error in
-                    DispatchQueue.main.async {
-                        guard let image else {
-                            completion(.failure(error ?? NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "读取屏幕图像失败。"])))
-                            return
-                        }
-                        snapshots.append((screen, image)); next(index + 1)
-                    }
-                }
+                self.screens = NSScreen.screens
+                self.displays = content.displays
+                self.next(0)
             }
-            next(0)
         }
     }
+    private func next(_ index: Int) {
+        if index >= screens.count { completion(.success(snapshots)); return }
+        let screen = screens[index]
+        let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+        guard let display = displays.first(where: { $0.displayID == id }) else {
+            completion(.failure(NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "显示器已断开，请重新截图。"])))
+            return
+        }
+        let config = SCStreamConfiguration()
+        // Quartz display dimensions may be logical points; retain backing pixels.
+        config.width = Int((screen.frame.width * screen.backingScaleFactor).rounded())
+        config.height = Int((screen.frame.height * screen.backingScaleFactor).rounded())
+        config.showsCursor = false
+        SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: display, excludingWindows: []), configuration: config) { image, error in
+            DispatchQueue.main.async {
+                guard let image else {
+                    self.completion(.failure(error ?? NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "读取屏幕图像失败。"])))
+                    return
+                }
+                // Only the main actor owns AppKit objects and mutable results;
+                // platform callbacks capture this actor reference and an index.
+                self.snapshots.append((self.screens[index], image))
+                self.next(index + 1)
+            }
+        }
+    }
+}
+
+@available(macOS 14.0, *)
+private func captureDisplaySnapshots(_ completion: @escaping (Result<[(NSScreen, CGImage)], Error>) -> Void) {
+    DispatchQueue.main.async { DisplaySnapshotReader(completion: completion).start() }
 }
 
 private final class CaptureInputController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
