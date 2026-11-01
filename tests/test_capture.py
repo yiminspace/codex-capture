@@ -73,6 +73,65 @@ for line in sys.stdin:
 '''
 
 
+class EditableRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="capture-editable-test-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.data = self.root / "data"
+        self.data.mkdir()
+        self.runtime = self.root / "plugins/codex-capture"
+        (self.runtime / "scripts").mkdir(parents=True)
+        self.script = self.runtime / "scripts/capture.py"
+        self.script.write_text("# synthetic editable runtime\n")
+        self.installation = {"installMode": "editable", "sourceRoot": str(self.root), "runtimePath": str(self.runtime)}
+        patch = mock.patch.object(capture, "DATA", self.data)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def save(self):
+        capture.atomic_json(self.data / "installation.json", self.installation)
+
+    def test_cached_skill_entry_executes_selected_checkout_with_original_arguments(self):
+        self.save()
+        with mock.patch.object(capture.os, "execv") as execute, mock.patch.object(sys, "argv", ["cached/capture.py", "status", "fixture-job"]):
+            capture.use_editable_runtime()
+        execute.assert_called_once_with(sys.executable, [sys.executable, str(self.script), "status", "fixture-job"])
+
+    def test_source_entry_does_not_redirect_recursively(self):
+        self.save()
+        with mock.patch.object(capture, "__file__", str(self.script)), mock.patch.object(capture.os, "execv") as execute:
+            capture.use_editable_runtime()
+        execute.assert_not_called()
+
+    def test_direct_cached_entry_observes_source_edits_without_reinstall(self):
+        self.save()
+        environment = dict(os.environ, CODEX_CAPTURE_DATA=str(self.data))
+        for value in ("first-source", "edited-source"):
+            self.script.write_text("import json,sys\nprint(json.dumps([" + repr(value) + ", sys.argv[1:]]))\n")
+            result = subprocess.run([sys.executable, str(SCRIPT), "status", "fixture-job"], env=environment, capture_output=True, text=True, check=True)
+            self.assertEqual(json.loads(result.stdout), [value, ["status", "fixture-job"]])
+
+    def test_cached_mode_keeps_installed_runtime(self):
+        self.installation["installMode"] = "cached"
+        self.save()
+        with mock.patch.object(capture.os, "execv") as execute:
+            capture.use_editable_runtime()
+        execute.assert_not_called()
+
+    def test_missing_checkout_stops_instead_of_silently_running_old_cache(self):
+        self.save()
+        self.script.unlink()
+        with self.assertRaisesRegex(ValueError, "源码已移动或删除"):
+            capture.use_editable_runtime()
+
+    def test_inconsistent_runtime_is_rejected(self):
+        self.installation["runtimePath"] = str(self.root / "other")
+        self.save()
+        with self.assertRaisesRegex(ValueError, "源码目录不匹配"):
+            capture.use_editable_runtime()
+
+
 class LocalPresetTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="capture-local-preset-")

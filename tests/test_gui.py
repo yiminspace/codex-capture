@@ -277,6 +277,38 @@ class HttpTests(unittest.TestCase):
 
 
 class ProcessLifecycleTests(unittest.TestCase):
+    def test_changed_python_same_path_and_version_restarts_gui_preserving_endpoint(self):
+        with tempfile.TemporaryDirectory(prefix="capture-gui-editable-") as tmp:
+            root = Path(tmp)
+            directory = fixture(root)
+            before = (directory / "state.json").read_bytes()
+            code = "import importlib.util,sys; s=importlib.util.spec_from_file_location('old_gui',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.RUNTIME_FINGERPRINT='previous-source'; m.serve(sys.argv[2])"
+            old = subprocess.Popen([sys.executable, "-c", code, str(SCRIPT), str(root)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    record = gui.read_object(root / "gui-server.json")
+                    if gui.server_health(record, root):
+                        break
+                    time.sleep(.05)
+                health = gui.server_health(record, root)
+                self.assertEqual(health["version"], gui.VERSION)
+                self.assertEqual(health["webRoot"], str(gui.WEB_ROOT))
+                self.assertEqual(health["runtimeFingerprint"], "previous-source")
+                current = gui.launch(root, open_browser=False)
+                old.wait(timeout=3)
+                self.assertNotEqual(current["pid"], old.pid)
+                live = gui.read_object(root / "gui-server.json")
+                self.assertEqual((live["port"], live["token"]), (record["port"], record["token"]))
+                self.assertTrue(gui.record_is_live(live, root, gui.WEB_ROOT))
+                self.assertEqual((directory / "state.json").read_bytes(), before)
+            finally:
+                with contextlib.suppress(Exception):
+                    gui.stop(root)
+                if old.poll() is None:
+                    old.terminate()
+                old.wait(timeout=3)
+
     def test_upgrade_stops_authenticated_old_gui_and_starts_current_without_touching_jobs(self):
         with tempfile.TemporaryDirectory(prefix="capture-gui-upgrade-") as tmp:
             root = Path(tmp)
@@ -344,6 +376,7 @@ class ProcessLifecycleTests(unittest.TestCase):
                 (previous / "web").mkdir()
                 (previous / "web/index.html").write_text("old assets")
                 shutil.copyfile(SCRIPT, previous / "scripts/gui.py")
+                shutil.copyfile(SCRIPT.with_name("capture.py"), previous / "scripts/capture.py")
                 code = "import importlib.util,sys; s=importlib.util.spec_from_file_location('old_gui',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.serve(sys.argv[2])"
                 old = subprocess.Popen([sys.executable, "-c", code, str(previous / "scripts/gui.py"), str(root)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 try:

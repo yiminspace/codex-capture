@@ -24,6 +24,7 @@
 | Voyage 组件、theme 明暗与主题偏好 | web 浏览器测试及截图检查 |
 | 本机鉴权、Origin/Host、路径和符号链接限制 | tests/test_gui.py |
 | GUI 服务独立启动、复用与协议兼容升级 | tests/test_gui.py 的隔离真实 HTTP 服务测试 |
+| editable 源码入口、缓存入口转发、源码修改生效、GUI 源码变化保留端口重启 | tests/test_capture.py、tests/test_gui.py 的隔离进程测试 |
 | 菜单栏工作台入口、阶段缓存和中断显示 | Swift 严格编译及 --self-test；真实输入动作需要手动触发 |
 | 固定签名复用、身份不匹配时保留旧助手、普通更新不重置权限、签名材料不进入安装包 | tests/test_native_signing.py、tests/test_install_signing.py、发布边界测试 |
 | 不同原生构建满足同一签名要求 | macOS 上使用本机固定身份签名两份不同的合成程序，交叉验证 DR；真实录屏授权保留仍需迁移授权后的更新验收 |
