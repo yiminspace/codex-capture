@@ -1,5 +1,7 @@
 """Screenshot-time routing checks; all projects, images and model responses are fixtures."""
 import argparse
+import collections
+import threading
 import contextlib
 import importlib.util
 import io
@@ -33,6 +35,9 @@ class FixtureServer:
         self.closed = False
         self.info = {"userAgent": "preparation-fixture"}
         self.process = mock.Mock(pid=12345)
+        self.process.poll.return_value = None
+        self.active = None
+        self.pending = collections.deque()
 
     def projects(self):
         return [self.project] if self.project else []
@@ -142,6 +147,94 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(state["cwd"], str(self.project_root))
         self.assertEqual(state["classifierModel"], "gpt-6-luna")
 
+    def test_shared_service_reuses_transport_but_isolates_screenshot_threads(self):
+        first, _ = self.prepare()
+        second, _ = self.prepare()
+        instances = []
+
+        def factory(directory):
+            server = FixtureServer(directory, self.project)
+            instances.append(server)
+            return server
+
+        with mock.patch.object(capture, "AppServer", side_effect=factory):
+            service = threading.Thread(target=capture.serve_classifier, kwargs={"idle_timeout": 0.3})
+            service.start()
+            try:
+                deadline = time.monotonic() + 2
+                while not capture.classifier_socket().exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                capture.request_preparation(first["preparationId"])
+                capture.request_preparation(second["preparationId"])
+            finally:
+                service.join(3)
+            self.assertFalse(service.is_alive())
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(len(instances[0].turns), 2)
+        self.assertEqual(len([request for method, request in instances[0].requests if method == "thread/start"]), 2)
+        for result in (first, second):
+            directory = self.directory(result)
+            self.assertEqual(capture.read_json(directory / "state.json")["phase"], "ready")
+            self.assertTrue((directory / "classification-debug.json").exists())
+        self.assertNotEqual(instances[0].turns[0][1][1]["path"], instances[0].turns[1][1][1]["path"])
+        self.assertTrue(instances[0].closed)
+
+    def test_cancelled_queued_capture_does_not_acquire_warm_transport(self):
+        result, _ = self.prepare()
+        capture.cancel_preparation(result["preparationId"])
+        pool = capture.ClassifierPool()
+        with mock.patch.object(capture, "AppServer") as factory:
+            with self.assertRaises(capture.Cancelled):
+                pool.acquire(self.directory(result))
+        factory.assert_not_called()
+        self.assertTrue(pool.lock.acquire(blocking=False))
+        pool.lock.release()
+
+    def test_models_and_followup_are_configurable_with_explicit_cli_priority(self):
+        capture.save_settings({"classifierModel": "fixture-classifier", "taskModel": "fixture-task", "followup": "  synthetic followup\n"})
+        result, _ = self.prepare()
+        # Changing defaults after this screenshot must not change its classification model.
+        capture.save_settings({"classifierModel": "fixture-new", "taskModel": "fixture-task", "followup": "  synthetic followup\n"})
+        server = self.classify(result)
+        self.assertEqual(server.requests[0][1]["model"], "fixture-classifier")
+        args = argparse.Namespace(image=str(self.image), text="fixture", followup=None, model=None, no_open=True, read_only=False)
+        _, directory = capture.create_job(args, self.image, None, capture.resolve_followup(None))
+        request = capture.read_json(directory / "request.json")
+        self.assertEqual(request["model"], "fixture-task")
+        self.assertEqual(request["followup"], "  synthetic followup\n")
+        args.model = "fixture-explicit"
+        _, directory = capture.create_job(args, self.image, None, capture.resolve_followup(""))
+        self.assertEqual(capture.read_json(directory / "request.json")["model"], "fixture-explicit")
+        self.assertEqual(capture.read_json(directory / "request.json")["followup"], "")
+
+    def test_annotated_image_is_copied_separately_without_changing_original(self):
+        marked = self.root / "marked.png"; marked.write_bytes(b"synthetic annotated pixels")
+        args = argparse.Namespace(text="fixture", model=None, no_open=True, read_only=False, annotated_image=str(marked))
+        _, directory = capture.create_job(args, self.image, None, "")
+        request = capture.read_json(directory / "request.json")
+        self.assertEqual(Path(request["image"]).read_bytes(), self.image.read_bytes())
+        self.assertEqual(Path(request["annotatedImage"]).read_bytes(), marked.read_bytes())
+        self.assertNotEqual(request["image"], request["annotatedImage"])
+        marked.unlink()
+        self.assertTrue(Path(request["annotatedImage"]).exists())
+
+    def test_debug_preserves_actual_classifier_input_and_output(self):
+        result, _ = self.prepare()
+        server = self.classify(result)
+        debug = capture.read_json(self.directory(result) / "classification-debug.json")
+        self.assertEqual(debug["threadRequest"], server.requests[0][1])
+        self.assertEqual(debug["turnRequest"]["input"], server.turns[0][1])
+        self.assertEqual(json.loads(debug["turnResponse"]["finalText"])["projectId"], self.project["id"])
+        self.assertIn("outputSchema", debug["turnRequest"])
+
+    def test_debug_retains_input_when_classifier_fails(self):
+        result, _ = self.prepare()
+        self.classify(result, fail=True)
+        debug = capture.read_json(self.directory(result) / "classification-debug.json")
+        self.assertIn("turnRequest", debug)
+        self.assertIn("fixture classification failure", debug["error"])
+
     def test_ready_is_published_after_classifier_close_and_worker_is_not_replayed(self):
         result, _ = self.prepare()
         phases = []
@@ -233,6 +326,19 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(capture.read_json(Path(job["statePath"]))["phase"], "cancelled")
         self.assertTrue((self.directory(result) / "cancel").exists())
         self.assertFalse((self.directory(other) / "cancel").exists())
+
+    def test_uncertain_route_explains_missing_accessibility_in_window_error(self):
+        result, _ = self.prepare()
+        directory = self.directory(result)
+        request = capture.read_json(directory / "request.json")
+        request["context"] = {"accessibility": {"status": "permission_required", "nodes": []}}
+        capture.atomic_json(directory / "request.json", request)
+        self.classify(result, confidence=0.2)
+        state = capture.read_json(directory / "state.json")
+        self.assertEqual(state["phase"], "needs_input")
+        self.assertIn("AX 树与页面 URL 均未采集", state["error"])
+        self.assertIn("synthetic screenshot fixture", state["error"])
+        self.assertNotIn("route.json", state["error"])
 
     def test_failed_and_uncertain_preparations_never_start_formal_task(self):
         for options, expected in (({"fail": True}, "failed"), ({"confidence": 0.3}, "needs_input")):
@@ -443,6 +549,16 @@ for line in sys.stdin:
         self.assertEqual(turns[1]["params"]["input"][0]["text"], original)
         image = Path(turns[1]["params"]["input"][1]["path"])
         self.assertEqual(image.read_bytes(), self.image.read_bytes())
+        # The next screenshot must reuse the classifier's stdio transport while
+        # still issuing a fresh ephemeral thread/start and a new turn.
+        before = requests()
+        initialize_count = sum(row.get("method") == "initialize" for row in before)
+        second = cli("prepare", "--image", str(self.image))
+        await_condition(lambda: capture.read_json(Path(second["statePath"]))["phase"] == "ready")
+        after = requests()
+        self.assertEqual(sum(row.get("method") == "initialize" for row in after), initialize_count)
+        self.assertEqual(sum(row.get("method") == "thread/start" and row["params"].get("ephemeral", False) for row in after), 2)
+        self.assertEqual(sum(row.get("method") == "turn/start" and row["params"]["threadId"] == "classifier" for row in after), 2)
 
 
 if __name__ == "__main__":

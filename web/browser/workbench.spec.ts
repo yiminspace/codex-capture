@@ -7,12 +7,17 @@ function detail(job = primary) {
   return { jobId: job.jobId, summary: job, state: { phase: job.phase, createdAt: job.createdAt, updatedAt: job.updatedAt, classifierModel: 'gpt-6-luna', actualModel: 'gpt-6.1-sol', classificationSeconds: 9.554, threadId: job.threadId, cwd: '/workspace/' + job.projectName, followupAttempts: 1, initialTurn: { status: 'completed', finalText: '示例便签可通过标签按钮进行编辑。<script>window.bad = true</script>', elapsedSeconds: 27.7 }, followupTurn: job.phase === 'completed' ? { status: 'completed', finalText: '示例讨论结束，保留现有便签行为。', elapsedSeconds: 50.2 } : undefined }, request: { text: job.text, followup: '请复查刚才的改动，完成必要验证，并总结结果。', context: { app: { name: 'Google Chrome' }, accessibility: { status: 'disabled' } } }, route: { title: job.title, reason: '示例截图中的便签标题与虚构项目一致。', confidence: .99 }, events: [{ at: '2025-01-01T08:05:30Z', stage: 'initial', method: 'turn/started' }, { at: '2025-01-01T08:06:30Z', stage: 'followup', itemType: 'commandExecution', command: 'npm run test', status: 'failed' }, { at: '2025-01-01T08:07:04Z', stage: 'followup', itemType: 'agentMessage', phase: 'final_answer', text: '示例标签检查未完成：测试浏览器拒绝访问。' }], lifecycle: [], logs: { 'worker.log': '', 'app-server.stderr.log': 'browser: permission denied' }, eventsTotal: 3, warnings: [] };
 }
 async function setup(page: Page, options: { delayPrimary?: boolean; unauthorized?: boolean; primaryDetail?: JobDetail } = {}) {
+  let settings = { classifierModel: 'fixture-classifier', taskModel: '', followup: 'synthetic preset\n' };
   const calls: string[] = []; const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.route('**/api/**', async route => {
     const url = new URL(route.request().url()); calls.push(route.request().method() + ' ' + url.pathname);
     expect(route.request().headers().authorization).toBe('Bearer fixture-token');
     if (options.unauthorized) { await route.fulfill({ status: 401, json: { error: 'Unauthorized' } }); return; }
+    if (url.pathname === '/api/settings') {
+      if (route.request().method() === 'POST') settings = route.request().postDataJSON();
+      await route.fulfill({ json: settings }); return;
+    }
     if (url.pathname === '/api/system') { await route.fulfill({ json: { helper: { registered: true, screenCaptureAllowed: true, accessibilityEnabled: false } } }); return; }
     if (url.pathname === '/api/jobs') {
       let jobs = [primary, secondary];
@@ -22,7 +27,7 @@ async function setup(page: Page, options: { delayPrimary?: boolean; unauthorized
       if (url.searchParams.get('status') === 'completed') jobs = jobs.filter(job => job.phase === 'completed');
       await route.fulfill({ json: { jobs, total: jobs.length, counts: { all: 2, active: 1, completed: 1, attention: 0 }, projects: ['sample-notes', 'sample-board'] } }); return;
     }
-    if (url.pathname.endsWith('/image')) { await route.fulfill({ contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7ioAAAAASUVORK5CYII=', 'base64') }); return; }
+    if (url.pathname.endsWith('/image') || url.pathname.endsWith('/annotated-image')) { await route.fulfill({ contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7ioAAAAASUVORK5CYII=', 'base64') }); return; }
     if (url.pathname.endsWith('/cancel') || url.pathname.endsWith('/open-chat')) { await route.fulfill({ json: { ok: true } }); return; }
     if (url.pathname.endsWith('/export')) { await route.fulfill({ json: { task: primary.jobId } }); return; }
     if (options.delayPrimary && url.pathname.endsWith(primary.jobId)) await new Promise(resolve => setTimeout(resolve, 700));
@@ -141,4 +146,35 @@ test('a verified change shows the conditional follow-up result and decision reas
   expect(await page.locator('.preset-text').textContent()).toBe(followupPreset);
   expect(calls.filter(call => call.startsWith('POST'))).toEqual([]);
   expect(errors).toEqual([]);
+});
+
+test('default model and followup settings can be saved without rewriting history', async ({ page }) => {
+  const { calls, errors } = await setup(page);
+  await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
+  await page.getByRole('button', { name: '默认设置', exact: true }).click();
+  const panel = page.getByRole('dialog', { name: '默认设置' });
+  await expect(panel).toBeVisible();
+  await panel.getByLabel('分类模型', { exact: false }).fill('fixture-new-classifier');
+  await panel.getByLabel('任务模型', { exact: false }).fill('fixture-new-task');
+  await panel.getByLabel('跟进预设', { exact: false }).fill('  Preserve synthetic preset.\n');
+  await panel.getByRole('button', { name: '保存设置' }).click();
+  await expect(panel.getByRole('status')).toContainText('已保存');
+  await page.screenshot({ path: test.info().outputPath('settings-dark.png') });
+  await panel.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.locator('.preset-text')).toContainText('请复查刚才的改动');
+  await page.getByRole('button', { name: '调整默认模型' }).click();
+  await expect(page.getByRole('dialog').getByLabel('任务模型', { exact: false })).toHaveValue('fixture-new-task');
+  await page.keyboard.press('Escape');
+  expect(calls.filter(call => call.startsWith('POST'))).toEqual(['POST /api/settings']);
+  expect(errors).toEqual([]);
+});
+
+test('annotated screenshot is shown alongside its original', async ({ page }) => {
+  const job = detail() as JobDetail;
+  job.request.annotatedImage = '/workspace/fixture/annotated.png';
+  await setup(page, { primaryDetail: job });
+  await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
+  await expect(page.getByAltText('本次任务的原始截图')).toBeVisible();
+  await expect(page.getByAltText('本次任务的标注截图')).toBeVisible();
+  await expect.poll(() => page.getByAltText('本次任务的标注截图').evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
 });

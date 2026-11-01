@@ -504,6 +504,20 @@ class JobLifecycleTests(unittest.TestCase):
                 self.assertEqual([turn[2] for turn in server.turns], ["classification"])
                 self.assertTrue(server.closed)
 
+    def test_annotation_is_sent_with_original_and_exact_user_text(self):
+        request = capture.read_json(self.directory / "request.json")
+        marked = self.directory / "annotated.png"; marked.write_bytes(b"synthetic marked image")
+        request["annotatedImage"] = str(marked)
+        capture.atomic_json(self.directory / "request.json", request)
+        server, state = self.execute()
+        initial = next(turn for turn in server.turns if turn[2] == "initial")
+        self.assertEqual(initial[1], [{"type": "text", "text": request["text"]},
+                                     {"type": "localImage", "path": str(self.image)},
+                                     {"type": "localImage", "path": str(marked)}])
+        classification = next(turn for turn in server.turns if turn[2] == "classification")
+        self.assertEqual(classification[1][1]["path"], str(self.image))
+        self.assertEqual(state["phase"], "completed")
+
     def test_foreground_evidence_reaches_only_classifier_and_initial_text_is_exact(self):
         request = capture.read_json(self.directory / "request.json")
         request["context"] = capture.sanitize_context({"app": {"name": "Browser"}, "window": {"title": "Sample Notes"}, "accessibility": {"status": "captured", "nodes": [{"role": "AXStaticText", "text": "编辑便签标签"}]}})
@@ -862,6 +876,10 @@ class ForegroundContextTests(unittest.TestCase):
         self.assertEqual(value["window"]["url"], "https://example.com/task")
         self.assertIn("编辑便签标签", encoded)
         self.assertEqual(value["accessibility"]["nodes"][-1]["sourceIndex"], 2)
+
+    def test_spa_route_survives_without_query_or_credentials(self):
+        value = capture.sanitize_context({"window": {"url": "https://user:pass@study.invalid/?token=secret#/daily/fixture?key=secret"}})
+        self.assertEqual(value["window"]["url"], "https://study.invalid/#/daily/fixture")
 
     def test_context_size_is_bounded_and_truncation_is_explicit(self):
         value = capture.sanitize_context({"accessibility": {"nodes": [{"role": "AXStaticText", "text": "x" * 10000} for _ in range(1000)]}})

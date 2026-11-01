@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import collections
+import importlib.util
 import datetime as dt
 import errno
 import fcntl
@@ -190,6 +191,13 @@ def worker_alive(state, job_id):
         return "capture.py" in result.stdout and bool(re.search(r"(?:^|\s)_worker\s+" + re.escape(job_id) + r"(?:\s|$)", result.stdout))
     except (OSError, subprocess.TimeoutExpired):
         return None
+
+
+def settings_backend():
+    spec = importlib.util.spec_from_file_location("capture_settings", Path(__file__).with_name("capture.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class JobStore:
@@ -395,15 +403,27 @@ class CaptureHandler(BaseHTTPRequestHandler):
             self.validate(api=path.startswith("/api/"))
             if path == "/api/health":
                 return self.send_json(200, {"ok": True, "version": self.server.version, "protocolVersion": 1, "pid": os.getpid(), "dataDirectory": str(self.server.store.root), "webRoot": str(self.server.web_root), "runtimeFingerprint": RUNTIME_FINGERPRINT, "assetsAvailable": (self.server.web_root / "index.html").is_file()})
+            if path == "/api/settings":
+                return self.send_json(200, settings_backend().settings_view(self.server.store.root))
             if path == "/api/system":
                 return self.send_json(200, self.server.store.system())
             if path == "/api/jobs":
                 return self.send_json(200, self.server.store.listing(parse_qs(parsed.query)))
-            match = re.fullmatch(r"/api/jobs/([^/]+)(?:/(image|export))?", path)
+            match = re.fullmatch(r"/api/jobs/([^/]+)(?:/(image|annotated-image|export))?", path)
             if match:
                 job_id, operation = match.groups()
-                if operation == "image":
-                    image = self.server.store.image_path(job_id)
+                if operation in ("image", "annotated-image"):
+                    if operation == "annotated-image":
+                        directory = self.server.store.directory(job_id)
+                        request = read_object(directory / "request.json")
+                        raw = request.get("annotatedImage")
+                        if not isinstance(raw, str) or Path(raw).parent.resolve() != directory.resolve() or Path(raw).name not in ("annotated.png", "annotated.jpg", "annotated.jpeg", "annotated.webp", "annotated.gif"):
+                            raise ApiError(404, "没有标注图")
+                        image = safe_path(directory, Path(raw).name)
+                        if not image.is_file():
+                            raise ApiError(404, "标注图不存在")
+                    else:
+                        image = self.server.store.image_path(job_id)
                     if image.stat().st_size > 25 * 1024 * 1024:
                         raise ApiError(413, "截图过大，请在任务文件夹查看")
                     return self.send_bytes(200, image.read_bytes(), mimetypes.guess_type(image.name)[0] or "application/octet-stream")
@@ -431,9 +451,10 @@ class CaptureHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 raise ApiError(400, "请求长度无效")
-            if length < 0 or length > 8192 or self.headers.get("Transfer-Encoding"):
+            if length < 0 or length > (256 * 1024 if urlsplit(self.path).path == "/api/settings" else 8192) or self.headers.get("Transfer-Encoding"):
                 raise ApiError(413, "请求过大")
             body = self.rfile.read(length)
+            payload = {}
             if body:
                 try:
                     payload = json.loads(body)
@@ -441,6 +462,12 @@ class CaptureHandler(BaseHTTPRequestHandler):
                         raise ValueError()
                 except (ValueError, UnicodeError):
                     raise ApiError(400, "请求应为 JSON 对象")
+            if urlsplit(self.path).path == "/api/settings":
+                try:
+                    settings = settings_backend().save_settings(payload, self.server.store.root)
+                except ValueError as error:
+                    raise ApiError(400, str(error))
+                return self.send_json(200, settings)
             if urlsplit(self.path).path == "/api/shutdown":
                 self.send_json(200, {"ok": True, "stopping": True})
                 self.wfile.flush()

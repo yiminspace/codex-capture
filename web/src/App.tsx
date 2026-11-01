@@ -35,6 +35,7 @@ function JobBadge({ job }: { job: JobSummary }) {
 }
 
 export default function App() {
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [selected, setSelected] = useState(initialLaunch.job);
   const [tokenPresent, setTokenPresent] = useState(initialLaunch.tokenPresent);
   const [search, setSearch] = useState(''); const [query, setQuery] = useState('');
@@ -139,8 +140,10 @@ export default function App() {
       <span className="vg-sp" />
       <span className="capture-shortcut"><kbd>⌥ S</kbd><span>截图并开始任务</span></span>
       <button className="vg-iconbtn" title="刷新记录" aria-label="刷新记录" onClick={() => { void refreshList(); void refreshDetail(); }}><Icon name="refresh" /></button>
+      <button className="vg-btn" disabled={!tokenPresent} onClick={() => setSettingsOpen(true)}>默认设置</button>
       <VoyageToolbar locale="zh" />
     </header>
+    {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
     {!tokenPresent ? <VoyageStateView variant="info" size="page" heading="从菜单栏打开任务工作台" description="选择 Codex Capture 菜单中的「任务工作台…」，或运行 codex-capture gui。当前窗口没有本机连接凭据。" /> : <>
       <main className="capture-workspace">
         <aside className="capture-sidebar" aria-label="任务筛选">
@@ -184,7 +187,7 @@ export default function App() {
             <div className="detail-content" role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`} key={selected + tab}>
               {currentDetail.state.error && <div className="warning-block" role="alert"><Icon name="alert" /><div><strong>这一步需要处理</strong><p>{currentDetail.state.error}</p></div></div>}
               {currentDetail.warnings?.length > 0 && <div className="warning-block"><Icon name="alert" /><div><strong>记录提示</strong>{currentDetail.warnings.map((warning, index) => <p key={index}>{typeof warning === 'string' ? warning : JSON.stringify(warning)}</p>)}</div></div>}
-              {tab === 'overview' ? <Overview detail={currentDetail} /> : tab === 'process' ? <ProcessView detail={currentDetail} /> : <DebugView detail={currentDetail} />}
+              {tab === 'overview' ? <Overview detail={currentDetail} onSettings={() => setSettingsOpen(true)} /> : tab === 'process' ? <ProcessView detail={currentDetail} /> : <DebugView detail={currentDetail} />}
             </div>
           </>}
         </section>
@@ -209,27 +212,27 @@ function FollowupDecisionView({ detail }: { detail: JobDetail }) {
   return <div className="followup-decision"><div className="event-heading"><strong>跟进判断</strong><VoyageStatusPill tone={presentation.tone}>{presentation.label}</VoyageStatusPill></div><p>{decision.reason}</p></div>;
 }
 
-function Screenshot({ jobId, hasImage }: { jobId: string; hasImage?: boolean }) {
+function Screenshot({ jobId, hasImage, variant = 'image' }: { jobId: string; hasImage?: boolean; variant?: 'image' | 'annotated-image' }) {
   const [image, setImage] = useState(''); const [error, setError] = useState('');
   useEffect(() => {
     setImage(''); setError(''); if (!hasImage) return;
     let alive = true; let url = ''; const controller = new AbortController();
-    response(`/api/jobs/${encodeURIComponent(jobId)}/image`, { signal: controller.signal }).then(res => res.blob()).then(blob => { if (alive) { url = URL.createObjectURL(blob); setImage(url); } }).catch(err => { if (alive) setError(err.message); });
+    response(`/api/jobs/${encodeURIComponent(jobId)}/${variant}`, { signal: controller.signal }).then(res => res.blob()).then(blob => { if (alive) { url = URL.createObjectURL(blob); setImage(url); } }).catch(err => { if (alive) setError(err.message); });
     return () => { alive = false; controller.abort(); if (url) URL.revokeObjectURL(url); };
-  }, [jobId, hasImage]);
+  }, [jobId, hasImage, variant]);
   if (!hasImage) return <div className="muted empty-image">未找到原始截图</div>;
   if (error) return <div className="inline-error">截图加载失败：{error}</div>;
-  return image ? <a className="screenshot-link" href={image} target="_blank" rel="noreferrer" title="在新窗口查看原始截图"><img className="task-screenshot" src={image} alt="本次任务的原始截图" /></a> : <div className="image-loading"><VoyageSpinner label="加载截图" /></div>;
+  return image ? <a className="screenshot-link" href={image} target="_blank" rel="noreferrer" title="在新窗口查看原始截图"><img className="task-screenshot" src={image} alt={variant === 'image' ? '本次任务的原始截图' : '本次任务的标注截图'} /></a> : <div className="image-loading"><VoyageSpinner label="加载截图" /></div>;
 }
 
-function Overview({ detail }: { detail: JobDetail }) {
+function Overview({ detail, onSettings }: { detail: JobDetail; onSettings: () => void }) {
   const { state, request, route } = detail;
   return <>
     <StageTrack detail={detail} />
-    <Section title="你的描述"><p className="user-description">{request.text || detail.summary.text || '描述记录不可用'}</p><Screenshot jobId={detail.jobId} hasImage={detail.summary.hasImage} /></Section>
-    <Section title="项目判断" extra={<span className="muted">置信度 {routeConfidence(route?.confidence)}</span>}><p className="route-reason">{route?.reason || (isActive(detail.summary) ? '正在结合截图和上下文识别项目。' : '没有保存项目判断理由。')}</p><div className="facts"><div><span>分类模型</span><strong>{state.classifierModel || '—'}</strong></div><div><span>任务模型</span><strong>{state.actualModel || '—'}</strong></div><div><span>工作目录</span><code>{state.cwd || '—'}</code></div></div></Section>
+    <Section title="你的描述"><p className="user-description">{request.text || detail.summary.text || '描述记录不可用'}</p><Screenshot jobId={detail.jobId} hasImage={detail.summary.hasImage} />{typeof request.annotatedImage === 'string' && <><h3>标注图</h3><Screenshot jobId={detail.jobId} hasImage variant="annotated-image" /></>}</Section>
+    <Section title="项目判断" extra={<div className="section-actions"><span className="muted">置信度 {routeConfidence(route?.confidence)}</span><button className="vg-btn" onClick={onSettings}>调整默认模型</button></div>}><p className="route-reason">{route?.reason || (isActive(detail.summary) ? '正在结合截图和上下文识别项目。' : '没有保存项目判断理由。')}</p><div className="facts"><div><span>分类模型</span><strong>{state.classifierModel || '—'}</strong></div><div><span>任务模型</span><strong>{state.actualModel || '—'}</strong></div><div><span>工作目录</span><code>{state.cwd || '—'}</code></div></div></Section>
     {state.initialTurn?.finalText && <Section title="首轮结果"><div className="result-text">{state.initialTurn.finalText}</div></Section>}
-    <Section title="预设跟进" extra={<span className="muted">已尝试 {state.followupAttempts || 0} 次</span>}><FollowupDecisionView detail={detail} /><blockquote className="preset-text">{request.followup?.trim() ? request.followup : '此任务未启用自动跟进。'}</blockquote>{state.followupTurn?.finalText && <div className="result-text">{state.followupTurn.finalText}</div>}</Section>
+    <Section title="预设跟进" extra={<div className="section-actions"><span className="muted">已尝试 {state.followupAttempts || 0} 次</span><button className="vg-btn" onClick={onSettings}>编辑跟进预设</button></div>}><FollowupDecisionView detail={detail} /><blockquote className="preset-text">{request.followup?.trim() ? request.followup : '此任务未启用自动跟进。'}</blockquote>{state.followupTurn?.finalText && <div className="result-text">{state.followupTurn.finalText}</div>}</Section>
   </>;
 }
 
@@ -259,4 +262,45 @@ function DebugView({ detail }: { detail: JobDetail }) {
 }
 function Raw({ title, value, open = false }: { title: string; value: unknown; open?: boolean }) {
   return <details className="raw-record" open={open || undefined}><summary>{title}</summary><pre>{typeof value === 'string' ? value : JSON.stringify(value, null, 2) || '无记录'}</pre></details>;
+}
+
+interface CaptureSettings { classifierModel: string; taskModel: string; followup: string }
+function SettingsPanel({ onClose }: { onClose: () => void }) {
+  const [settings, setSettings] = useState<CaptureSettings | null>(null);
+  const [error, setError] = useState(''); const [saved, setSaved] = useState(false); const [busy, setBusy] = useState(false);
+  const formRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    api<CaptureSettings>('/api/settings', { signal: controller.signal }).then(setSettings).catch(error => { if (!controller.signal.aborted) setError(error.message); });
+    formRef.current?.focus();
+    return () => controller.abort();
+  }, []);
+  function update(key: keyof CaptureSettings, value: string) { setSettings(current => current ? { ...current, [key]: value } : current); setSaved(false); }
+  async function save() {
+    if (!settings) return;
+    setBusy(true); setError(''); setSaved(false);
+    try {
+      const value = await api<CaptureSettings>('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) });
+      setSettings(value); setSaved(true);
+    } catch (error) { setError(error instanceof Error ? error.message : '设置保存失败'); }
+    finally { setBusy(false); }
+  }
+  return <div className="settings-backdrop"><div className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabIndex={-1} ref={formRef} onKeyDown={event => {
+    if (event.key === 'Escape' && !busy) onClose();
+    if (event.key === 'Tab') {
+      const controls = formRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled)');
+      const first = controls?.[0]; const last = controls?.[controls.length - 1];
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === formRef.current)) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }
+  }}>
+    <div className="settings-heading"><div><h2 id="settings-title">默认设置</h2><p>保存后用于后续任务，历史记录保留实际使用的配置。</p></div><button className="vg-btn" disabled={busy} onClick={onClose}>关闭</button></div>
+    {!settings ? <p>{error || '正在读取设置…'}</p> : <form onSubmit={event => { event.preventDefault(); void save(); }}>
+      <div className="settings-models"><label>分类模型<input required value={settings.classifierModel} list="capture-models" maxLength={128} onChange={event => update('classifierModel', event.target.value)} /><span>用于识别截图所属项目，新截图生效。</span></label>
+      <label>任务模型<input value={settings.taskModel} list="capture-models" maxLength={128} placeholder="留空使用 Codex 默认模型" onChange={event => update('taskModel', event.target.value)} /><span>用于正式执行任务，留空沿用 Codex 配置。</span></label></div>
+      <datalist id="capture-models"><option value="gpt-6-luna" /><option value="gpt-6.1-sol" /></datalist>
+      <label>跟进预设<textarea rows={10} value={settings.followup} onChange={event => update('followup', event.target.value)} /><span>首轮产生代码改动时自动跟进一次。清空可禁用。</span></label>
+      <div className="settings-footer"><span role="status" className={error ? 'inline-error' : 'muted'}>{error || (saved ? '已保存，后续任务生效。' : '模型 ID 可直接输入；可用性以当前账号为准。')}</span><button className="vg-btn vg-btn-primary" disabled={busy} type="submit">{busy ? '保存中…' : '保存设置'}</button></div>
+    </form>}
+  </div></div>;
 }

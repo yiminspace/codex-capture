@@ -54,7 +54,7 @@ jobs:
       - name: Compile and self-test without UI
         run: |
           xcrun swiftc -warnings-as-errors \
-            -framework AppKit -framework Carbon -framework ApplicationServices \
+            -framework AppKit -framework Carbon -framework ApplicationServices -framework ScreenCaptureKit \
             plugins/codex-capture/native/CaptureApp.swift \
             -o "$RUNNER_TEMP/CodexCapture"
           "$RUNNER_TEMP/CodexCapture" --self-test

@@ -133,7 +133,7 @@ if [ ! -f "$capture_tmp/reuse-native" ]; then
   mkdir -p "$capture_app/Contents/MacOS"
   cp "$capture_root/plugins/codex-capture/native/Info.plist" "$capture_app/Contents/Info.plist"
   /usr/bin/xcrun swiftc -O \
-    -framework AppKit -framework Carbon -framework ApplicationServices \
+    -framework AppKit -framework Carbon -framework ApplicationServices -framework ScreenCaptureKit \
     "$capture_root/plugins/codex-capture/native/CaptureApp.swift" \
     -o "$capture_app/Contents/MacOS/CodexCapture"
   capture_sign_args=(sign --app "$capture_app")
