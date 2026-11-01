@@ -417,6 +417,24 @@ if should_launch == '1':
 # A cache upgrade may remove the old GUI's static assets while leaving its
 # process alive. Refresh an already-running workbench from this installation;
 # gui.launch preserves its endpoint and only replaces the authenticated GUI.
+def write_installation(record):
+    path = data / 'installation.json'
+    temporary = path.with_suffix('.json.installing')
+    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + '\n')
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+# Cached entry points consult this record before starting Python. Publish the
+# new selection before gui.launch spawns a replacement, including when leaving
+# editable mode; otherwise the old selection redirects it to the wrong tree.
+try:
+    selection = json.loads((data / 'installation.json').read_text())
+except (OSError, ValueError):
+    selection = {}
+if not isinstance(selection, dict):
+    selection = {}
+selection.update(sourceRoot=root, installMode='editable' if editable == '1' else 'cached', runtimePath=str(runtime))
+write_installation(selection)
 sys.path.insert(0, str(runtime / 'scripts'))
 import gui
 gui_status = None
@@ -450,7 +468,7 @@ record = {
     'codexVersion': subprocess.check_output([codex, '--version'], text=True).strip(),
     'sha256': hashes,
 }
-(data / 'installation.json').write_text(json.dumps(record, ensure_ascii=False, indent=2) + '\n')
+write_installation(record)
 print(json.dumps(record, ensure_ascii=False, indent=2))
 if should_launch == '1' and hotkey_status.get('registered') is not True:
     raise SystemExit('插件已安装，但 Option+S 未注册成功；请查看 hotkeyStatus/lastError。助手菜单仍可截图。')
