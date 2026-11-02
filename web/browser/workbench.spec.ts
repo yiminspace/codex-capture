@@ -169,12 +169,12 @@ test('default model and followup settings can be saved without rewriting history
   expect(errors).toEqual([]);
 });
 
-test('annotated screenshot is shown alongside its original', async ({ page }) => {
+test('annotated screenshot replaces its original', async ({ page }) => {
   const job = detail() as JobDetail;
   job.request.annotatedImage = '/workspace/fixture/annotated.png';
   await setup(page, { primaryDetail: job });
   await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
-  await expect(page.getByAltText('本次任务的原始截图')).toBeVisible();
+  await expect(page.getByAltText('本次任务的原始截图')).toHaveCount(0);
   await expect(page.getByAltText('本次任务的标注截图')).toBeVisible();
   await expect.poll(() => page.getByAltText('本次任务的标注截图').evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
 });

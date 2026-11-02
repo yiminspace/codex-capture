@@ -222,14 +222,14 @@ function Screenshot({ jobId, hasImage, variant = 'image' }: { jobId: string; has
   }, [jobId, hasImage, variant]);
   if (!hasImage) return <div className="muted empty-image">未找到原始截图</div>;
   if (error) return <div className="inline-error">截图加载失败：{error}</div>;
-  return image ? <a className="screenshot-link" href={image} target="_blank" rel="noreferrer" title="在新窗口查看原始截图"><img className="task-screenshot" src={image} alt={variant === 'image' ? '本次任务的原始截图' : '本次任务的标注截图'} /></a> : <div className="image-loading"><VoyageSpinner label="加载截图" /></div>;
+  return image ? <a className="screenshot-link" href={image} target="_blank" rel="noreferrer" title={variant === 'image' ? '在新窗口查看原始截图' : '在新窗口查看标注截图'}><img className="task-screenshot" src={image} alt={variant === 'image' ? '本次任务的原始截图' : '本次任务的标注截图'} /></a> : <div className="image-loading"><VoyageSpinner label="加载截图" /></div>;
 }
 
 function Overview({ detail, onSettings }: { detail: JobDetail; onSettings: () => void }) {
   const { state, request, route } = detail;
   return <>
     <StageTrack detail={detail} />
-    <Section title="你的描述"><p className="user-description">{request.text || detail.summary.text || '描述记录不可用'}</p><Screenshot jobId={detail.jobId} hasImage={detail.summary.hasImage} />{typeof request.annotatedImage === 'string' && <><h3>标注图</h3><Screenshot jobId={detail.jobId} hasImage variant="annotated-image" /></>}</Section>
+    <Section title="你的描述"><p className="user-description">{request.text || detail.summary.text || '描述记录不可用'}</p><Screenshot jobId={detail.jobId} hasImage={Boolean(request.annotatedImage) || detail.summary.hasImage} variant={request.annotatedImage ? 'annotated-image' : 'image'} /></Section>
     <Section title="项目判断" extra={<div className="section-actions"><span className="muted">置信度 {routeConfidence(route?.confidence)}</span><button className="vg-btn" onClick={onSettings}>调整默认模型</button></div>}><p className="route-reason">{route?.reason || (isActive(detail.summary) ? '正在结合截图和上下文识别项目。' : '没有保存项目判断理由。')}</p><div className="facts"><div><span>分类模型</span><strong>{state.classifierModel || '—'}</strong></div><div><span>任务模型</span><strong>{state.actualModel || '—'}</strong></div><div><span>工作目录</span><code>{state.cwd || '—'}</code></div></div></Section>
     {state.initialTurn?.finalText && <Section title="首轮结果"><div className="result-text">{state.initialTurn.finalText}</div></Section>}
     <Section title="预设跟进" extra={<div className="section-actions"><span className="muted">已尝试 {state.followupAttempts || 0} 次</span><button className="vg-btn" onClick={onSettings}>编辑跟进预设</button></div>}><FollowupDecisionView detail={detail} /><blockquote className="preset-text">{request.followup?.trim() ? request.followup : '此任务未启用自动跟进。'}</blockquote>{state.followupTurn?.finalText && <div className="result-text">{state.followupTurn.finalText}</div>}</Section>
