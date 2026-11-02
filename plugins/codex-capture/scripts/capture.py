@@ -1168,15 +1168,6 @@ def run_job(job_id):
                         record[key] = state[key]
                 append_record(directory / "lifecycle.jsonl", record)
 
-        def open_desktop():
-            if request["noOpen"] or sys.platform != "darwin" or not state.get("threadId"):
-                return
-            try:
-                opened = subprocess.run(["open", "-g", "codex://threads/" + state["threadId"]], capture_output=True, text=True, timeout=15)
-                save(state["phase"], desktopOpenExitCode=opened.returncode, desktopOpenedAt=now())
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                save(state["phase"], desktopOpenError=str(exc))
-
         try:
             save("connecting", workerPid=os.getpid(), workerParentPid=os.getppid(), executable=str(Path(__file__).resolve()), startedAt=now())
             preparation_id = request.get("preparationId")
@@ -1267,9 +1258,6 @@ def run_job(job_id):
             if server:
                 shutdown = server.close()
                 save(state["phase"], shutdown=shutdown)
-            # The desktop can load complete external history and infer project
-            # membership after the independent runtime releases the thread.
-            open_desktop()
 
 
 def job_dir(job_id):
@@ -1410,7 +1398,7 @@ def main():
         p.add_argument("--context-file", help="可选：截图前保存的前景窗口 JSON 上下文")
         p.add_argument("--followup", help="覆盖本机跟进预设；传入空字符串可禁用自动跟进")
         p.add_argument("--model", help="主任务模型；不指定时使用本机设置或 Codex 默认配置")
-        p.add_argument("--no-open", action="store_true")
+        p.add_argument("--no-open", action="store_true", help="兼容旧调用；任务结束后始终不自动打开桌面 chat")
         p.add_argument("--read-only", action="store_true")
     p = sub.add_parser("prepare", help="截图后立即在后台识别项目")
     p.add_argument("--image", required=True)
