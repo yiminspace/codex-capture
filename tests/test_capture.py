@@ -573,47 +573,23 @@ class JobLifecycleTests(unittest.TestCase):
         self.assertEqual(state["followupAttempts"], 0)
         self.assertEqual([t[2] for t in server.turns], ["classification", "initial"])
 
-    def test_desktop_opens_once_after_both_turns_and_runtime_close(self):
+    def test_finished_tasks_do_not_open_desktop(self):
         request = capture.read_json(self.directory / "request.json")
-        request["noOpen"] = False
+        request["noOpen"] = False  # Legacy callers must also remain in the background.
         capture.atomic_json(self.directory / "request.json", request)
-        server = FakeJobServer(self.directory, self.project)
-        observed_stages = []
-
-        def opened(*args, **kwargs):
-            observed_stages.append(([turn[2] for turn in server.turns], server.closed, capture.read_json(self.directory / "state.json")["phase"]))
-            return subprocess.CompletedProcess(args[0], 0)
-
-        with mock.patch.object(capture, "AppServer", return_value=server), mock.patch.object(capture.sys, "platform", "darwin"), mock.patch.object(capture.subprocess, "run", side_effect=opened) as launch:
-            capture.run_job(self.job_id)
-        self.assertEqual(observed_stages, [(["classification", "initial", "followup"], True, "completed")])
-        launch.assert_called_once()
-        self.assertEqual(launch.call_args.args[0], ["open", "-g", "codex://threads/main-thread"])
-        self.assertEqual(launch.call_args.kwargs["timeout"], 15)
-        state = capture.read_json(self.directory / "state.json")
-        self.assertEqual(state["phase"], "completed")
-        self.assertEqual(state["desktopOpenExitCode"], 0)
-
-    def test_failed_and_interrupted_tasks_open_history_after_runtime_close(self):
-        request = capture.read_json(self.directory / "request.json")
-        request["noOpen"] = False
-        capture.atomic_json(self.directory / "request.json", request)
-        for status in ("failed", "interrupted"):
+        for status in ("completed", "failed", "interrupted"):
             with self.subTest(status=status):
                 capture.atomic_json(self.directory / "state.json", {"jobId": self.job_id, "phase": "queued", "followupAttempts": 0})
                 server = FakeJobServer(self.directory, self.project, initial_status=status)
-                observations = []
-
-                def opened(*args, **kwargs):
-                    observations.append((server.closed, capture.read_json(self.directory / "state.json")["phase"]))
-                    return subprocess.CompletedProcess(args[0], 0)
-
-                with mock.patch.object(capture, "AppServer", return_value=server), mock.patch.object(capture.sys, "platform", "darwin"), mock.patch.object(capture.subprocess, "run", side_effect=opened) as launch:
+                with mock.patch.object(capture, "AppServer", return_value=server), mock.patch.object(capture.sys, "platform", "darwin"), mock.patch.object(capture.subprocess, "run") as launch:
                     capture.run_job(self.job_id)
-                self.assertEqual(observations, [(True, "failed")])
-                self.assertEqual([turn[2] for turn in server.turns], ["classification", "initial"])
-                self.assertEqual(launch.call_args.args[0], ["open", "-g", "codex://threads/main-thread"])
-                self.assertEqual(capture.read_json(self.directory / "state.json")["phase"], "failed")
+                launch.assert_not_called()
+                self.assertTrue(server.closed)
+                expected_stages = ["classification", "initial"] + (["followup"] if status == "completed" else [])
+                self.assertEqual([turn[2] for turn in server.turns], expected_stages)
+                state = capture.read_json(self.directory / "state.json")
+                self.assertEqual(state["phase"], "completed" if status == "completed" else "failed")
+                self.assertNotIn("desktopOpenedAt", state)
 
     def test_uncertain_route_does_not_open_classifier_as_a_task(self):
         request = capture.read_json(self.directory / "request.json")
@@ -624,19 +600,6 @@ class JobLifecycleTests(unittest.TestCase):
         launch.assert_not_called()
         self.assertTrue(server.closed)
         self.assertEqual(state["phase"], "needs_input")
-
-    def test_desktop_open_failure_does_not_interrupt_task_or_followup(self):
-        request = capture.read_json(self.directory / "request.json")
-        request["noOpen"] = False
-        capture.atomic_json(self.directory / "request.json", request)
-        for error in (OSError("desktop unavailable"), subprocess.TimeoutExpired("open", 15)):
-            with self.subTest(error=type(error).__name__):
-                capture.atomic_json(self.directory / "state.json", {"jobId": self.job_id, "phase": "queued", "followupAttempts": 0})
-                with mock.patch.object(capture.sys, "platform", "darwin"), mock.patch.object(capture.subprocess, "run", side_effect=error):
-                    server, state = self.execute()
-                self.assertEqual(state["phase"], "completed")
-                self.assertIn("desktopOpenError", state)
-                self.assertEqual([turn[2] for turn in server.turns], ["classification", "initial", "followup"])
 
     def test_no_open_does_not_launch_desktop_after_completion(self):
         with mock.patch.object(capture.sys, "platform", "darwin"), mock.patch.object(capture.subprocess, "run") as launch:

@@ -22,6 +22,7 @@
 | 旧记录读取、损坏记录、后台退出显示中断 | tests/test_gui.py；web 阶段状态单测 |
 | 原始图片鉴权、详情、日志与诊断导出 | tests/test_gui.py；web 浏览器测试 |
 | 阶段日志持久化、工具进展记录 | tests/test_capture.py；web 执行过程页测试 |
+| 任务成功、失败或中断后保持后台，不自动打开 chat | tests/test_capture.py；旧调用 noOpen=false 也不打开 |
 | 取消和打开 chat 的边界 | tests/test_gui.py；web 模拟 API 验证，不取消真实任务 |
 | 过期网络响应不会覆盖当前选择 | web 单测与浏览器测试 |
 | Voyage 组件、theme 明暗与主题偏好 | web 浏览器测试及截图检查 |
