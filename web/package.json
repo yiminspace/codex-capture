@@ -10,7 +10,7 @@
     "test:browser": "playwright test"
   },
   "dependencies": {
-    "@yiminlab/voyage": "0.15.0",
+    "@yiminlab/voyage": "0.19.0",
     "react": "19.2.7",
     "react-dom": "19.2.7"
   },
