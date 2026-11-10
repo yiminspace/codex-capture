@@ -1855,7 +1855,6 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                     self.inputSession = nil
                     self.finishCapture(temporary: session.temporary)
                     self.refreshJobProgress()
-                    self.openWorkbench(jobID: job)
                     self.item.button?.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: "任务已开始")
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                         self.item.button?.image = NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "Codex Capture")

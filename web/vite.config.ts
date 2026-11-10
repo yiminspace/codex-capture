@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
-  base: '/',
+  base: '/codex-capture/',
   build: { outDir: '../plugins/codex-capture/web', emptyOutDir: true },
   server: { host: '127.0.0.1' },
 });

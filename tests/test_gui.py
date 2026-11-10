@@ -227,13 +227,18 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.request("/api/jobs")[0], 200)
 
     def test_static_assets_work_but_traversal_and_symlinks_do_not(self):
+        # urllib follows the legacy root redirect; both entry points serve the app.
         self.assertEqual(self.request("/", auth=False)[0], 200)
-        code, _, headers = self.request("/assets/app.js", auth=False)
+        self.assertEqual(self.request("/codex-capture", auth=False)[0], 200)
+        self.assertEqual(self.request("/codex-capture/", auth=False)[0], 200)
+        self.assertEqual(self.request("/assets/app.js", auth=False)[0], 404)
+        self.assertEqual(self.request("/other/", auth=False)[0], 404)
+        code, _, headers = self.request("/codex-capture/assets/app.js", auth=False)
         self.assertEqual(code, 200)
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         (self.web / "escape.txt").symlink_to(self.directory / "state.json")
-        self.assertEqual(self.request("/escape.txt", auth=False)[0], 404)
-        self.assertEqual(self.request("/%2e%2e/jobs/" + JOB + "/state.json", auth=False)[0], 404)
+        self.assertEqual(self.request("/codex-capture/escape.txt", auth=False)[0], 404)
+        self.assertEqual(self.request("/codex-capture/%2e%2e/jobs/" + JOB + "/state.json", auth=False)[0], 404)
 
     def test_image_and_export_are_authenticated_and_export_is_download(self):
         self.assertEqual(self.request(f"/api/jobs/{JOB}/image", auth=False)[0], 401)
@@ -294,7 +299,7 @@ class HttpTests(unittest.TestCase):
             result = gui.launch(self.root, JOB, open_browser=False)
         start.assert_not_called()
         opened.assert_not_called()
-        self.assertIn("#token=fixture-token&job=" + JOB, result["url"])
+        self.assertEqual(result["url"], self.url + "/codex-capture/#token=fixture-token&job=" + JOB)
         self.assertEqual((self.root / "gui-server.json").stat().st_mode & 0o777, 0o600)
 
     def test_invalid_json_and_body_limits_do_not_cancel(self):

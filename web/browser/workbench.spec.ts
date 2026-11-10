@@ -38,7 +38,7 @@ async function setup(page: Page, options: { delayPrimary?: boolean; unauthorized
 
 test('real Voyage theme controls, screenshot and safe task history', async ({ page }) => {
   const { errors, calls } = await setup(page);
-  await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
+  await page.goto(`/codex-capture/#token=fixture-token&job=${primary.jobId}`);
   await expect(page.getByRole('heading', { name: primary.title })).toBeVisible();
   await expect(page.getByAltText('本次任务的原始截图')).toHaveAttribute('src', /^blob:/);
   await expect(page.getByText('示例讨论结束，保留现有便签行为。')).toBeVisible();
@@ -58,7 +58,7 @@ test('real Voyage theme controls, screenshot and safe task history', async ({ pa
 
 test('search and project filters preserve the selected record', async ({ page }) => {
   const { errors } = await setup(page);
-  await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
+  await page.goto(`/codex-capture/#token=fixture-token&job=${primary.jobId}`);
   await expect(page.getByRole('heading', { name: primary.title })).toBeVisible();
   await page.getByRole('textbox', { name: '搜索任务' }).fill('排序');
   await expect(page.locator('.job-row')).toHaveCount(1);
@@ -73,7 +73,7 @@ test('search and project filters preserve the selected record', async ({ page })
 
 test('a delayed previous selection never overwrites the current detail', async ({ page }) => {
   await setup(page, { delayPrimary: true });
-  await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
+  await page.goto(`/codex-capture/#token=fixture-token&job=${primary.jobId}`);
   await page.locator('.job-row').filter({ hasText: secondary.title }).click();
   await expect(page.getByRole('heading', { name: secondary.title })).toBeVisible();
   await page.waitForTimeout(1100);
@@ -83,7 +83,7 @@ test('a delayed previous selection never overwrites the current detail', async (
 
 test('explicit cancel, diagnostic download and logs stay bound to selected job', async ({ page }) => {
   const { calls, errors } = await setup(page);
-  await page.goto(`/#token=fixture-token&job=${secondary.jobId}`);
+  await page.goto(`/codex-capture/#token=fixture-token&job=${secondary.jobId}`);
   await expect(page.getByRole('heading', { name: secondary.title })).toBeVisible();
   page.once('dialog', dialog => dialog.accept());
   await page.getByRole('button', { name: '取消任务' }).click();
@@ -100,13 +100,13 @@ test('explicit cancel, diagnostic download and logs stay bound to selected job',
 
 test('authentication errors show recovery guidance', async ({ page }) => {
   await setup(page, { unauthorized: true });
-  await page.goto('/#token=fixture-token');
+  await page.goto('/codex-capture/#token=fixture-token');
   await expect(page.getByText('连接凭据已失效。请从菜单栏重新打开任务工作台。')).toBeVisible();
 });
 
 test('narrow screens keep content within the viewport', async ({ page }) => {
   await setup(page); await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
+  await page.goto(`/codex-capture/#token=fixture-token&job=${primary.jobId}`);
   await expect(page.getByRole('heading', { name: primary.title })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
 });
@@ -119,7 +119,7 @@ test('discussion without changes explicitly skips follow-up and retains the orig
   job.state.followupDecision = { send: false, reason: '首轮仅讨论；工作目录没有本轮代码变更，因此未发送跟进语句。' };
   job.request.followup = followupPreset;
   const { calls, errors } = await setup(page, { primaryDetail: job });
-  await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
+  await page.goto(`/codex-capture/#token=fixture-token&job=${primary.jobId}`);
   const followupStage = page.locator('.stage-track li').last();
   await expect(followupStage).toContainText('已跳过');
   await expect(followupStage).not.toHaveClass(/current|finished/);
@@ -138,7 +138,7 @@ test('a verified change shows the conditional follow-up result and decision reas
   job.state.followupTurn = { status: 'completed', finalText: '示例便签标签复查完成，测试通过。', elapsedSeconds: 72 };
   job.request.followup = followupPreset;
   const { calls, errors } = await setup(page, { primaryDetail: job });
-  await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
+  await page.goto(`/codex-capture/#token=fixture-token&job=${primary.jobId}`);
   await expect(page.locator('.followup-decision')).toContainText('跟进已完成');
   await expect(page.locator('.followup-decision')).toContainText(job.state.followupDecision.reason);
   await expect(page.locator('.stage-track li').last()).toHaveClass(/finished/);
@@ -150,7 +150,7 @@ test('a verified change shows the conditional follow-up result and decision reas
 
 test('default model and followup settings can be saved without rewriting history', async ({ page }) => {
   const { calls, errors } = await setup(page);
-  await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
+  await page.goto(`/codex-capture/#token=fixture-token&job=${primary.jobId}`);
   await page.getByRole('button', { name: '默认设置', exact: true }).click();
   const panel = page.getByRole('dialog', { name: '默认设置' });
   await expect(panel).toBeVisible();
@@ -173,7 +173,7 @@ test('annotated screenshot replaces its original', async ({ page }) => {
   const job = detail() as JobDetail;
   job.request.annotatedImage = '/workspace/fixture/annotated.png';
   await setup(page, { primaryDetail: job });
-  await page.goto(`/#token=fixture-token&job=${primary.jobId}`);
+  await page.goto(`/codex-capture/#token=fixture-token&job=${primary.jobId}`);
   await expect(page.getByAltText('本次任务的原始截图')).toHaveCount(0);
   await expect(page.getByAltText('本次任务的标注截图')).toBeVisible();
   await expect.poll(() => page.getByAltText('本次任务的标注截图').evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
