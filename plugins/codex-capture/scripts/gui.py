@@ -277,7 +277,7 @@ class JobStore:
         return {"jobId": job_id, "state": state, "request": request, "route": route,
                 "events": events, "eventsTotal": event_count, "eventsTruncated": event_count > len(events),
                 "lifecycle": lifecycle, "lifecycleTotal": life_count, "lifecycleTruncated": life_count > len(lifecycle),
-                "logs": {name: read_log(safe_path(directory, name)) for name in ("worker.log", "app-server.stderr.log")},
+                "logs": {name: read_log(safe_path(directory, name)) for name in ("worker.log", "app-server.stderr.log", "classification-debug.json")},
                 "warnings": warnings, "summary": summary}
 
     def image_path(self, job_id, request=None, optional=False):

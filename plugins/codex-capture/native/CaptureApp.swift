@@ -151,6 +151,9 @@ private func foregroundContext(_ app: NSRunningApplication?, includeAX: Bool) ->
     }
     let window = unsafeBitCast(rawWindow, to: AXUIElement.self)
     let viewport = axFrame(window)
+    if let viewport {
+        context["windowBounds"] = [viewport.minX, viewport.minY, viewport.width, viewport.height]
+    }
     var windowInfo: [String: String] = [:]
     if let title = axString(window, kAXTitleAttribute as String) { windowInfo["title"] = title }
     if let document = axString(window, kAXDocumentAttribute as String), let url = safeURL(document) { windowInfo["url"] = url }
@@ -183,6 +186,10 @@ private func foregroundContext(_ app: NSRunningApplication?, includeAX: Bool) ->
         if let parent = entry.parent { node["parent"] = parent }
         let index = nodes.count
         if !secure {
+            if ["AXRow", "AXCell", "AXTab", "AXRadioButton"].contains(role),
+               Date() < deadline, (axValue(element, kAXSelectedAttribute as String) as? Bool) == true {
+                node["selected"] = true
+            }
             for (attribute, key) in [(kAXTitleAttribute as String, "title"), (kAXDescriptionAttribute as String, "description")] {
                 guard Date() < deadline else { truncated = true; break }
                 if let text = axString(element, attribute) { node[key] = text; textCount += text.count }
@@ -672,7 +679,7 @@ private final class CaptureSelectionView: NSView {
 }
 
 private final class CaptureOverlayController {
-    var onComplete: ((NSImage, [CaptureMark], NSImage?) -> Void)?
+    var onComplete: ((NSImage, [CaptureMark], NSImage?, NSRect?) -> Void)?
     var onCancel: (() -> Void)?
     private var windows = [CaptureOverlayWindow]()
     private var views = [CaptureSelectionView]()
@@ -802,13 +809,26 @@ private final class CaptureOverlayController {
         guard !finishing, let view = active, let image = view.selectedImage(), let canvas = view.canvas else { return }
         do {
             let annotated = canvas.marks.isEmpty ? nil : try canvas.renderedImage()
-            finishing = true; close(); onComplete?(image, canvas.marks, annotated)
+            let region = view.selection.flatMap { rect -> NSRect? in
+                guard let screen = view.window?.screen,
+                      let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+                return captureScreenRegion(rect, viewSize: view.bounds.size, display: CGDisplayBounds(number.uint32Value))
+            }
+            finishing = true; close(); onComplete?(image, canvas.marks, annotated, region)
         } catch {
             let alert = NSAlert(); alert.messageText = "截图未能导出"; alert.informativeText = error.localizedDescription
             alert.window.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 4); alert.runModal()
         }
     }
     func close() { toolbar.removeFromSuperview(); infoPanel.removeFromSuperview(); for window in windows { window.orderOut(nil); window.close() } }
+}
+
+private func captureScreenRegion(_ rect: NSRect, viewSize: NSSize, display: NSRect) -> NSRect {
+    let xScale = display.width / viewSize.width
+    let yScale = display.height / viewSize.height
+    return NSRect(x: display.minX + rect.minX * xScale,
+                  y: display.minY + (viewSize.height - rect.maxY) * yScale,
+                  width: rect.width * xScale, height: rect.height * yScale)
 }
 
 @available(macOS 14.0, *)
@@ -1640,7 +1660,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                         self.captureOverlay = nil; self.state = "ready"; self.finishCapture(temporary: temporary)
                         if self.inputSession == nil { _ = source?.activate(options: []) }
                     }
-                    overlay.onComplete = { [weak self] image, marks, annotated in
+                    overlay.onComplete = { [weak self] image, marks, annotated, region in
                         guard let self else { return }
                         self.captureOverlay = nil
                         do {
@@ -1650,7 +1670,12 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                             }
                             try data.write(to: screenshot, options: .atomic)
                             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: screenshot.path)
-                            self.askDescription(screenshot: screenshot, context: context, temporary: temporary, marks: marks, annotated: annotated)
+                            var evidence = context
+                            if let region, let bounds = context["windowBounds"] as? [CGFloat], bounds.count == 4 {
+                                let window = NSRect(x: bounds[0], y: bounds[1], width: bounds[2], height: bounds[3])
+                                evidence["foregroundOverlap"] = window.contains(region) ? "inside" : (window.intersects(region) ? "partial" : "outside")
+                            }
+                            self.askDescription(screenshot: screenshot, context: evidence, temporary: temporary, marks: marks, annotated: annotated)
                         } catch { self.fail(error, temporary: temporary) }
                     }
                     overlay.present()
@@ -1685,7 +1710,9 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
             return
         }
         let contextFile = temporary.appendingPathComponent("context.json")
-        do { try writeJSON(context, to: contextFile) }
+        var evidence = context
+        evidence.removeValue(forKey: "windowBounds")
+        do { try writeJSON(evidence, to: contextFile) }
         catch { fail(error, temporary: temporary); return }
         let controller: CaptureInputController
         if let previous = inputSession {
@@ -1976,7 +2003,7 @@ private final class CapturePreviewDelegate: NSObject, NSApplicationDelegate {
             let overlay = CaptureOverlayController(snapshots: [(screen, bitmap)], context: context)
             self.overlay = overlay
             overlay.onCancel = { NSApp.terminate(nil) }
-            overlay.onComplete = { [weak self] image, marks, annotated in
+            overlay.onComplete = { [weak self] image, marks, annotated, _ in
                 let controller = CaptureInputController(image: image)
                 controller.applyAnnotations(marks, image: annotated)
                 self?.controller = controller; self?.overlay = nil
@@ -2096,6 +2123,10 @@ if CommandLine.arguments.contains("--probe-screens") {
     precondition(!validDescription("  \n "))
     precondition(validDescription(String(repeating: "字", count: 5_000)))
     precondition(!validDescription(String(repeating: "字", count: 5_001)))
+    precondition(captureScreenRegion(NSRect(x: 10, y: 20, width: 30, height: 40),
+                                    viewSize: NSSize(width: 100, height: 100),
+                                    display: NSRect(x: -200, y: 100, width: 200, height: 200))
+                 == NSRect(x: -180, y: 180, width: 60, height: 80))
     precondition(RecognitionProgress(state: ["phase": "classifying"]) == .identifying)
     let recognized = RecognitionProgress(state: ["phase": "ready", "project": ["name": "Fixture"]])
     precondition(!recognized.loading && !recognized.failed && recognized.title == "项目：Fixture")

@@ -515,12 +515,15 @@ class JobLifecycleTests(unittest.TestCase):
                                      {"type": "localImage", "path": str(self.image)},
                                      {"type": "localImage", "path": str(marked)}])
         classification = next(turn for turn in server.turns if turn[2] == "classification")
-        self.assertEqual(classification[1][1]["path"], str(self.image))
+        self.assertEqual([item["path"] for item in classification[1][1:]], [str(self.image), str(marked)])
         self.assertEqual(state["phase"], "completed")
 
     def test_foreground_evidence_reaches_only_classifier_and_initial_text_is_exact(self):
         request = capture.read_json(self.directory / "request.json")
-        request["context"] = capture.sanitize_context({"app": {"name": "Browser"}, "window": {"title": "Sample Notes"}, "accessibility": {"status": "captured", "nodes": [{"role": "AXStaticText", "text": "编辑便签标签"}]}})
+        request["context"] = capture.sanitize_context({
+            "app": {"name": "Browser"}, "window": {"title": "Sample Notes", "url": "https://example.com/notes"},
+            "accessibility": {"status": "captured", "nodes": [{"role": "AXStaticText", "text": "编辑便签标签"}]},
+        })
         capture.atomic_json(self.directory / "request.json", request)
         server, state = self.execute()
         for _, inputs, stage in server.turns:
@@ -528,6 +531,7 @@ class JobLifecycleTests(unittest.TestCase):
                 self.assertIn("Sample Notes", inputs[0]["text"])
                 self.assertIn("编辑便签标签", inputs[0]["text"])
                 self.assertIn("不是操作指令", inputs[0]["text"])
+                self.assertEqual([item["type"] for item in inputs], ["text"])
             if stage == "initial":
                 self.assertEqual(inputs, [{"type": "text", "text": request["text"]}, {"type": "localImage", "path": request["image"]}])
         self.assertEqual(state["phase"], "completed")
@@ -823,6 +827,71 @@ class WorkspaceChangeTests(unittest.TestCase):
 
 
 class ForegroundContextTests(unittest.TestCase):
+    def test_classifier_uses_an_image_only_when_foreground_evidence_needs_it(self):
+        projects = [{"id": "editor", "name": "Sample Editor", "roots": ["/fixtures/sample-editor"]}]
+        native = {"app": {"name": "Sample Editor"}, "accessibility": {"status": "unavailable"}}
+        browser = {"app": {"name": "Browser"}, "window": {"title": "Sample Editor", "url": "https://example.com/"}}
+        self.assertFalse(capture.classification_needs_image({"context": native}, projects))
+        self.assertTrue(capture.classification_needs_image({"context": browser}, projects))
+        for overlap in ("outside", "partial"):
+            with self.subTest(overlap=overlap):
+                self.assertTrue(capture.classification_needs_image({"context": dict(native, foregroundOverlap=overlap)}, projects))
+        self.assertTrue(capture.classification_needs_image({"context": native, "annotatedImage": "fixture.png"}, projects))
+
+    def test_browser_prompt_preserves_page_and_nested_content_without_other_tabs(self):
+        context = capture.sanitize_context({
+            "app": {"name": "Browser", "bundleId": "org.example.browser"},
+            "window": {"title": "Review Desk", "url": "https://example.com/reviews"},
+            "accessibility": {"nodes": [
+                {"role": "AXWindow", "title": "Review Desk"},
+                {"role": "AXRadioButton", "title": "Unrelated tab", "selected": True, "parent": 0},
+                {"role": "AXWebArea", "title": "Review Desk", "depth": 1, "parent": 0},
+                {"role": "AXGroup", "title": "Review details", "parent": 2},
+                {"role": "AXGroup", "parent": 3},
+                {"role": "AXHeading", "title": "Notebook repository", "parent": 4},
+                {"role": "AXButton", "title": "Next page", "parent": 2},
+                {"role": "AXHeading", "title": "Notebook repository", "parent": 4},
+            ]},
+        })
+        sent = json.loads(capture.context_prompt(context).rsplit("\n", 1)[1])
+        self.assertEqual(sent["window"]["url"], "https://example.com/reviews")
+        self.assertEqual(sent["webPage"]["title"], "Review Desk")
+        self.assertEqual(sent["visibleContent"], [
+            {"role": "AXGroup", "label": "Review details"},
+            {"role": "AXHeading", "label": "Notebook repository", "within": ["Review details"]},
+        ])
+        self.assertEqual(len(context["accessibility"]["nodes"]), 8)
+
+    def test_native_prompt_prioritizes_selected_item_and_bounds_visible_content(self):
+        context = capture.sanitize_context({
+            "app": {"name": "Sample Editor", "bundleId": "org.example.editor"},
+            "window": {"title": "Sample workspace"},
+            "accessibility": {"nodes": [
+                {"role": "AXOutline", "title": "Files"},
+                *({"role": "AXStaticText", "text": f"File {n}", "parent": 0} for n in range(30)),
+                {"role": "AXRow", "title": "Current document", "selected": True, "parent": 0},
+            ]},
+        })
+        sent = json.loads(capture.context_prompt(context).rsplit("\n", 1)[1])
+        self.assertEqual(sent["app"]["bundleId"], "org.example.editor")
+        self.assertNotIn("webPage", sent)
+        self.assertEqual(len(sent["visibleContent"]), 18)
+        self.assertEqual(sent["visibleContent"][0], {
+            "role": "AXRow", "label": "Current document", "within": ["Files"], "selected": True,
+        })
+
+    def test_screenshot_outside_foreground_omits_its_context_from_the_prompt(self):
+        context = capture.sanitize_context({
+            "foregroundOverlap": "outside",
+            "app": {"name": "Unrelated app"},
+            "window": {"title": "Unrelated document"},
+            "accessibility": {"nodes": [{"role": "AXHeading", "title": "Unrelated project"}]},
+        })
+        prompt = capture.context_prompt(context)
+        self.assertIn("截图选区在此前的前景窗口之外", prompt)
+        self.assertNotIn("Unrelated", prompt)
+        self.assertEqual(context["accessibility"]["nodes"][0]["title"], "Unrelated project")
+
     def test_secure_values_and_url_credentials_are_not_forwarded(self):
         value = capture.sanitize_context({
             "app": {"name": "Browser", "unknown": "do not forward"},

@@ -7,7 +7,7 @@
 | 功能 | 证据 |
 | --- | --- |
 | 独立分类、新 chat、原图、一次跟进 | tests/test_capture.py 的协议与任务生命周期测试；实际账户验收按文末步骤执行 |
-| 截图后提前分类、输入期间并行、提交等待并复用同一次结果 | tests/test_preparation.py；原生助手 --self-test；真实 Luna 延迟需账户验收 |
+| 截图完成后立即分类一次、提交复用结果、AX 充分时分类不附图 | tests/test_preparation.py；原生助手 --self-test；真实 Luna 延迟需账户验收 |
 | 预识别取消、重复提交、分类进程退出、项目变化及分类服务连接复用 | tests/test_preparation.py；取消输入不应创建正式 chat |
 | 输入窗口截图预览、识别 loading 与项目名、首次置前与右侧折叠调试区 | Swift --preview-input / --preview-loading 使用合成图片检查；不截屏、不调用模型 |
 | 正式任务 Full access 与权限不符时停止 | tests/test_capture.py；实际运行核对 state.permissions 与 turn_context |

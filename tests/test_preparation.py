@@ -528,7 +528,12 @@ for line in sys.stdin:
                 time.sleep(0.03)
             self.fail("Synthetic subprocess did not reach expected state")
 
-        prepared = cli("prepare", "--image", str(self.image))
+        context = self.root / "context.json"
+        context.write_text(json.dumps({
+            "window": {"title": "Fixture project", "url": "https://fixture.invalid/notes"},
+            "accessibility": {"status": "captured", "nodes": [{"role": "AXHeading", "title": "Notes"}]},
+        }))
+        prepared = cli("prepare", "--image", str(self.image), "--context-file", str(context))
         try:
             await_condition(lambda: any(row.get("method") == "turn/start" for row in requests()))
             self.assertEqual(capture.read_json(Path(prepared["statePath"]))["phase"], "classifying")
@@ -546,6 +551,10 @@ for line in sys.stdin:
         self.assertTrue(state["classificationReused"])
         turns = [row for row in requests() if row.get("method") == "turn/start"]
         self.assertEqual([row["params"]["threadId"] for row in turns], ["classifier", "formal"])
+        classification_input = turns[0]["params"]["input"]
+        self.assertEqual([item["type"] for item in classification_input], ["text"])
+        self.assertIn("https://fixture.invalid/notes", classification_input[0]["text"])
+        self.assertNotIn(original, classification_input[0]["text"])
         self.assertEqual(turns[1]["params"]["input"][0]["text"], original)
         image = Path(turns[1]["params"]["input"][1]["path"])
         self.assertEqual(image.read_bytes(), self.image.read_bytes())
