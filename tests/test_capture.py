@@ -457,6 +457,45 @@ class JobLifecycleTests(unittest.TestCase):
             capture.run_job(self.job_id)
         return server, capture.read_json(self.directory / "state.json")
 
+    def test_conversation_queues_original_inputs_before_opening_desktop(self):
+        request_path = self.directory / "request.json"
+        request = capture.read_json(request_path)
+        request.update(startConversation=True, annotatedImage=str(self.directory / "annotated.png"))
+        capture.atomic_json(request_path, request)
+        creator = FakeJobServer(self.directory, self.project)
+        queue_server = FakeJobServer(self.directory, self.project)
+
+        def queue_request(method, params):
+            self.assertTrue(creator.closed)
+            self.assertEqual(method, "thread/queue/add")
+            self.assertEqual(params, {
+                "threadId": "main-thread",
+                "clientUserMessageId": self.job_id,
+                "input": [{"type": "text", "text": request["text"]},
+                          {"type": "localImage", "path": request["image"]},
+                          {"type": "localImage", "path": request["annotatedImage"]}],
+            })
+
+        def open_desktop(command, **_):
+            self.assertTrue(queue_server.closed)
+            self.assertEqual(command, ["open", "codex://threads/main-thread", "codex://threads/wake/main-thread"])
+
+        with mock.patch.object(capture.sys, "platform", "darwin"), \
+             mock.patch.object(capture, "AppServer", side_effect=[creator, queue_server]), \
+             mock.patch.object(queue_server, "request", side_effect=queue_request) as enqueue, \
+             mock.patch.object(capture.subprocess, "run", side_effect=open_desktop) as open_chat:
+            capture.run_job(self.job_id)
+
+        enqueue.assert_called_once()
+        open_chat.assert_called_once()
+        self.assertEqual([stage for _, _, stage in creator.turns], ["classification"])
+        self.assertEqual(queue_server.turns, [])
+        self.assertEqual(self.snapshot_count, 0)
+        state = capture.read_json(self.directory / "state.json")
+        self.assertEqual(state["phase"], "completed")
+        self.assertEqual(state["followupAttempts"], 0)
+        self.assertIn("handedOffAt", state)
+
     def test_routes_native_image_and_follows_up_in_same_thread_once(self):
         server, state = self.execute()
         self.assertEqual(state["phase"], "completed")

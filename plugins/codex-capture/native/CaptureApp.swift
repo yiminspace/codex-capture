@@ -34,9 +34,12 @@ private struct ScreenCapturePermissionState {
     }
 }
 
-private func submissionArguments(preparationID: String, text: String, annotatedImage: String? = nil) -> [String] {
+private func submissionArguments(preparationID: String, text: String, annotatedImage: String? = nil, startConversation: Bool = false) -> [String] {
     // Keep the user's text byte-for-byte, including leading dashes and whitespace.
-    ["submit", "--preparation-id", preparationID, "--text=" + text] + (annotatedImage.map { ["--annotated-image", $0] } ?? [])
+    var arguments = ["submit", "--preparation-id", preparationID, "--text=" + text]
+    if let annotatedImage { arguments += ["--annotated-image", annotatedImage] }
+    if startConversation { arguments.append("--start-conversation") }
+    return arguments
 }
 
 private func validDescription(_ text: String) -> Bool {
@@ -888,7 +891,7 @@ private func captureDisplaySnapshots(_ completion: @escaping (Result<[(NSScreen,
 }
 
 private final class CaptureInputController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
-    var onSubmit: ((String) -> Void)?
+    var onSubmit: ((String, Bool) -> Void)?
     var onCancel: (() -> Void)?
     private let textView = NSTextView()
     private let preview = NSImageView()
@@ -901,8 +904,10 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
     private let statusIcon = NSImageView()
     private let projectLabel = NSTextField(labelWithString: RecognitionProgress.identifying.title)
     private let detailLabel = NSTextField(wrappingLabelWithString: RecognitionProgress.identifying.detail)
-    private let messageLabel = NSTextField(wrappingLabelWithString: "⌘ Return 开始任务 · Return 换行")
-    private let startButton = NSButton(title: "开始任务", target: nil, action: nil)
+    private let submissionHint = "⌘ Return 快捷完成 · Return 换行\n开始会话会直接打开 Codex，跳过预设跟进"
+    private let messageLabel = NSTextField(wrappingLabelWithString: "")
+    private let startButton = NSButton(title: "快捷完成", target: nil, action: nil)
+    private let conversationButton = NSButton(title: "开始会话", target: nil, action: nil)
     private let cancelButton = NSButton(title: "取消", target: nil, action: nil)
     private let debugButton = NSButton(title: "Luna 调试 ▸", target: nil, action: nil)
     private let debugPanel = NSView()
@@ -1017,13 +1022,17 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
         messageLabel.font = .systemFont(ofSize: 11)
         messageLabel.textColor = .secondaryLabelColor
         messageLabel.maximumNumberOfLines = 2
+        messageLabel.stringValue = submissionHint
         startButton.bezelStyle = .rounded
         startButton.target = self; startButton.action = #selector(submitInput)
         startButton.keyEquivalent = "\r"; startButton.keyEquivalentModifierMask = .command
+        conversationButton.bezelStyle = .rounded
+        conversationButton.target = self; conversationButton.action = #selector(submitInput)
+        conversationButton.toolTip = "直接打开 Codex 会话，跳过预设跟进"
         cancelButton.bezelStyle = .rounded
         cancelButton.target = self; cancelButton.action = #selector(cancelInput)
         cancelButton.keyEquivalent = "\u{1b}"; cancelButton.keyEquivalentModifierMask = []
-        let buttons = NSStackView(views: [cancelButton, startButton])
+        let buttons = NSStackView(views: [cancelButton, conversationButton, startButton])
         buttons.orientation = .horizontal; buttons.spacing = 8
 
         debugButton.bezelStyle = .inline
@@ -1233,11 +1242,12 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
         refreshControls()
     }
 
-    func setSubmitting(_ value: Bool, awaitingPreparation: Bool = false) {
+    func setSubmitting(_ value: Bool, awaitingPreparation: Bool = false, startConversation: Bool = false) {
         submitting = value
         annotateButton.isEnabled = !value
         cancellable = !value || awaitingPreparation
-        messageLabel.stringValue = value ? (awaitingPreparation ? "正在准备项目识别，随后开始任务…" : "正在创建任务…") : "⌘ Return 开始任务 · Return 换行"
+        let status = startConversation ? "正在打开 Codex 会话…" : "正在提交后台任务…"
+        messageLabel.stringValue = value ? (awaitingPreparation ? "正在准备项目识别…" : status) : submissionHint
         messageLabel.textColor = .secondaryLabelColor
         refreshControls()
     }
@@ -1259,6 +1269,7 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
 
     private func refreshControls() {
         startButton.isEnabled = !submitting && !progress.failed && validDescription(textView.string)
+        conversationButton.isEnabled = startButton.isEnabled
         cancelButton.isEnabled = cancellable
         window?.standardWindowButton(.closeButton)?.isEnabled = cancellable
         textView.isEditable = !submitting
@@ -1266,7 +1277,7 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
 
     func textDidChange(_ notification: Notification) {
         if !submitting {
-            messageLabel.stringValue = textView.string.count > 5_000 ? "描述请控制在 5000 字以内。" : "⌘ Return 开始任务 · Return 换行"
+            messageLabel.stringValue = textView.string.count > 5_000 ? "描述请控制在 5000 字以内。" : submissionHint
             messageLabel.textColor = textView.string.count > 5_000 ? .systemRed : .secondaryLabelColor
         }
         refreshControls()
@@ -1274,7 +1285,7 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
 
     @objc private func submitInput(_ sender: Any?) {
         guard !submitting, !progress.failed, validDescription(textView.string) else { return }
-        onSubmit?(textView.string)
+        onSubmit?(textView.string, (sender as? NSButton) === conversationButton)
     }
 
     @objc private func cancelInput(_ sender: Any?) {
@@ -1301,6 +1312,7 @@ private final class CaptureInputSession {
     var preparationFinished = false
     var cancelled = false
     var pendingDescription: String?
+    var startConversation = false
     var submissionInFlight = false
     let startedAt = Date()
 
@@ -1725,10 +1737,11 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         controller.applyAnnotations(marks, image: annotated)
         let session = CaptureInputSession(controller: controller, temporary: temporary)
         inputSession = session
-        controller.onSubmit = { [weak self, weak session] text in
+        controller.onSubmit = { [weak self, weak session] text, startConversation in
             guard let self, let session, self.inputSession === session else { return }
             session.pendingDescription = text
-            session.controller.setSubmitting(true, awaitingPreparation: session.preparationID == nil)
+            session.startConversation = startConversation
+            session.controller.setSubmitting(true, awaitingPreparation: session.preparationID == nil, startConversation: startConversation)
             self.state = "submitting"; self.writeStatus()
             self.submitPreparedSession(session)
         }
@@ -1858,10 +1871,11 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         }
         session.submissionInFlight = true
         session.pollTimer?.invalidate(); session.pollTimer = nil
-        session.controller.setSubmitting(true)
+        let startConversation = session.startConversation
+        session.controller.setSubmitting(true, startConversation: startConversation)
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let result = try command(launcherURL.path, submissionArguments(preparationID: preparationID, text: text, annotatedImage: annotationPath), timeout: 30)
+                let result = try command(launcherURL.path, submissionArguments(preparationID: preparationID, text: text, annotatedImage: annotationPath, startConversation: startConversation), timeout: 30)
                 DispatchQueue.main.async {
                     guard self.inputSession === session, !session.cancelled else { return }
                     session.submissionInFlight = false
@@ -1882,7 +1896,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                     self.inputSession = nil
                     self.finishCapture(temporary: session.temporary)
                     self.refreshJobProgress()
-                    self.item.button?.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: "任务已开始")
+                    self.item.button?.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: startConversation ? "会话已提交" : "任务已提交")
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                         self.item.button?.image = NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "Codex Capture")
                     }
@@ -2008,7 +2022,7 @@ private final class CapturePreviewDelegate: NSObject, NSApplicationDelegate {
                 controller.applyAnnotations(marks, image: annotated)
                 self?.controller = controller; self?.overlay = nil
                 controller.onCancel = { controller.dismiss(); NSApp.terminate(nil) }
-                controller.onSubmit = { _ in controller.showSubmissionError("这是界面预览，不会创建任务。") }
+                controller.onSubmit = { _, _ in controller.showSubmissionError("这是界面预览，不会创建任务。") }
                 controller.updateRecognition(RecognitionProgress(state: ["phase": "ready", "project": ["name": "Demo Notes"]]))
                 controller.present()
             }
@@ -2025,7 +2039,7 @@ private final class CapturePreviewDelegate: NSObject, NSApplicationDelegate {
                              "finalText": "{\"projectId\":\"demo-notes\",\"confidence\":0.99}"],
         ])
         controller.onCancel = { controller.dismiss(); NSApp.terminate(nil) }
-        controller.onSubmit = { _ in controller.showSubmissionError("这是界面预览，不会创建任务。") }
+        controller.onSubmit = { _, _ in controller.showSubmissionError("这是界面预览，不会创建任务。") }
         controller.present()
         if !CommandLine.arguments.contains("--preview-loading") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
@@ -2119,6 +2133,8 @@ if CommandLine.arguments.contains("--probe-screens") {
     precondition(newlyAllowed.allowed && newlyAllowed.requested)
     let originalDescription = "- 原文\n  保留空格与换行  \n"
     precondition(submissionArguments(preparationID: "fixture", text: originalDescription) == ["submit", "--preparation-id", "fixture", "--text=" + originalDescription])
+    precondition(submissionArguments(preparationID: "fixture", text: originalDescription, annotatedImage: "annotated.png", startConversation: true) ==
+        ["submit", "--preparation-id", "fixture", "--text=" + originalDescription, "--annotated-image", "annotated.png", "--start-conversation"])
     precondition(validDescription(originalDescription))
     precondition(!validDescription("  \n "))
     precondition(validDescription(String(repeating: "字", count: 5_000)))

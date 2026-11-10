@@ -1251,6 +1251,7 @@ def run_job(job_id):
         if state["phase"] != "queued":
             return  # Never replay an ambiguous or already-dispatched job.
         request = read_json(directory / "request.json")
+        start_conversation = request.get("startConversation", False)
         server = None
 
         def save(phase, **updates):
@@ -1265,6 +1266,8 @@ def run_job(job_id):
                 append_record(directory / "lifecycle.jsonl", record)
 
         try:
+            if start_conversation and sys.platform != "darwin":
+                raise RuntimeError("开始会话目前仅支持 macOS。")
             save("connecting", workerPid=os.getpid(), workerParentPid=os.getppid(), executable=str(Path(__file__).resolve()), startedAt=now())
             preparation_id = request.get("preparationId")
             if preparation_id:
@@ -1289,7 +1292,7 @@ def run_job(job_id):
             params = {"cwd": root, "projectId": project["id"], "threadSource": "codex_capture", "developerInstructions": "此 chat 已由 Codex Capture 分发到目标项目。你负责在当前 chat 执行用户的截图任务，不要再次调用 Capture 为同一个需求派发新任务。"}
             if request["readOnly"]:
                 params.update(approvalPolicy="never", sandbox="read-only")
-            else:
+            elif not start_conversation:
                 # Select the built-in profile explicitly. A workspace sandbox
                 # with '/' writable still protects paths such as .git and is
                 # displayed as Custom by the desktop, not Full access.
@@ -1305,7 +1308,7 @@ def run_job(job_id):
                 "approvalsReviewer": created.get("approvalsReviewer"),
                 "sandbox": created.get("sandbox"),
             }
-            if not request["readOnly"]:
+            if not request["readOnly"] and not start_conversation:
                 profile = permission_state["activePermissionProfile"]
                 sandbox = permission_state["sandbox"]
                 permission_state["fullAccessVerified"] = (
@@ -1314,17 +1317,34 @@ def run_job(job_id):
                     and permission_state["approvalPolicy"] == "never"
                 )
             save("creating_thread", threadId=thread_id, actualModel=created.get("model"), nativeProjectId=created["thread"].get("projectId"), workerParentPid=os.getppid(), permissions=permission_state)
-            if not request["readOnly"] and not permission_state["fullAccessVerified"]:
+            if not start_conversation and not request["readOnly"] and not permission_state["fullAccessVerified"]:
                 raise NeedsInput("Codex 未确认 Full access 权限，任务尚未开始；请查看调试记录中的 permissions，检查 Codex 版本或权限要求后重新提交。")
             save("starting_initial")
             server.request("thread/name/set", {"threadId": thread_id, "name": "截图任务 · " + route["title"][:70]})
             # The target chat receives exactly the user's message and original image.
             # Foreground evidence is solely an input to project classification.
-            before = workspace_snapshot(root) if request["followup"].strip() and not request["readOnly"] else None
-            save("running_initial", inputTypes=["text", "localImage"])
             inputs = [{"type": "text", "text": request["text"]}, {"type": "localImage", "path": request["image"]}]
             if request.get("annotatedImage"):
                 inputs.append({"type": "localImage", "path": request["annotatedImage"]})
+            if start_conversation:
+                # Queue on an unloaded thread so this process cannot start the turn.
+                server.close()
+                server = None
+                server = AppServer(directory)
+                save("starting_initial", appServerPid=server.process.pid)
+                server.request("thread/queue/add", {"threadId": thread_id, "input": inputs, "clientUserMessageId": job_id})
+                server.close()
+                server = None
+                try:
+                    subprocess.run(["open", "codex://threads/" + thread_id, "codex://threads/wake/" + thread_id],
+                                   check=True, capture_output=True, timeout=15)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    raise RuntimeError("消息已保存，但系统未能打开 Codex 会话。可以从工作台重新打开。") from exc
+                handed_off_at = now()
+                save("completed", completedAt=handed_off_at, handedOffAt=handed_off_at)
+                return
+            before = workspace_snapshot(root) if request["followup"].strip() and not request["readOnly"] else None
+            save("running_initial", inputTypes=["text", "localImage"])
             first = server.turn(thread_id, inputs, "initial")
             save("initial_finished", initialTurn=first)
             if (directory / "cancel").exists():
@@ -1370,6 +1390,8 @@ def create_job(args, source, context, followup, preparation_id=None):
     shutil.copyfile(source, image)
     os.chmod(image, 0o600)
     request = {"text": args.text, "image": str(image), "followup": followup, "model": args.model if args.model is not None else read_settings().get("taskModel") or None, "noOpen": args.no_open, "readOnly": args.read_only, "context": context}
+    if getattr(args, "start_conversation", False):
+        request["startConversation"] = True
     annotated = getattr(args, "annotated_image", None)
     if annotated:
         annotated_source = image_source(annotated)
@@ -1401,7 +1423,13 @@ def start_job(job_id, directory):
 
 
 def submit(args):
-    followup = resolve_followup(args.followup)
+    start_conversation = getattr(args, "start_conversation", False)
+    if start_conversation:
+        if sys.platform != "darwin":
+            raise ValueError("开始会话目前仅支持 macOS。")
+        if args.read_only:
+            raise ValueError("开始会话使用桌面权限设置，不能与 --read-only 一起使用。")
+    followup = "" if start_conversation else resolve_followup(args.followup)
     if not args.text.strip():
         raise ValueError("请输入任务描述")
     preparation_id = getattr(args, "preparation_id", None)
@@ -1419,6 +1447,8 @@ def submit(args):
                 previous_request = read_json(job_dir(reply["jobId"]) / "request.json")
                 if previous_request["text"] != args.text:
                     raise ValueError("此截图已提交其他需求，请重新截图。")
+                if previous_request.get("startConversation", False) != start_conversation:
+                    raise ValueError("此截图已通过另一个入口提交，请重新截图。")
                 print(json.dumps(reply, ensure_ascii=False))
                 return
             prepared_state = read_json(prepared_directory / "state.json")
@@ -1489,6 +1519,7 @@ def main():
             source = p.add_mutually_exclusive_group(required=True)
             source.add_argument("--image")
             source.add_argument("--preparation-id", help="复用截图后已启动的项目识别")
+            p.add_argument("--start-conversation", action="store_true", help="在 Codex 桌面打开会话并发送原始需求，跳过预设跟进")
         p.add_argument("--text", required=name == "submit")
         p.add_argument("--annotated-image", help="可选：保留原图并附加标注图")
         p.add_argument("--context-file", help="可选：截图前保存的前景窗口 JSON 上下文")
