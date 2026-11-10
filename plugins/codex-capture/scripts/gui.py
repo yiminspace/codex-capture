@@ -433,7 +433,11 @@ class CaptureHandler(BaseHTTPRequestHandler):
                 return self.send_json(200, detail)
             if path.startswith("/api/"):
                 raise ApiError(404, "找不到该接口")
-            static = safe_path(self.server.web_root, "index.html" if path == "/" else path.lstrip("/"))
+            if path in ("/", "/codex-capture"):
+                return self.send_bytes(302, b"", extra={"Location": "/codex-capture/" + ("?" + parsed.query if parsed.query else "")})
+            if not path.startswith("/codex-capture/"):
+                raise ApiError(404, "找不到该页面")
+            static = safe_path(self.server.web_root, path[len("/codex-capture/"):] or "index.html")
             if not static.is_file():
                 raise ApiError(404, "找不到该页面")
             return self.send_bytes(200, static.read_bytes(), mimetypes.guess_type(static.name)[0] or "application/octet-stream")
@@ -643,7 +647,7 @@ def launch(data_directory, job_id=None, open_browser=True):
         fragment = {"token": record["token"]}
         if job_id:
             fragment["job"] = job_id
-        url = f"http://127.0.0.1:{record['port']}/#" + urlencode(fragment)
+        url = f"http://127.0.0.1:{record['port']}/codex-capture/#" + urlencode(fragment)
         if open_browser:
             if sys.platform == "darwin":
                 subprocess.run(["open", url], check=True, timeout=15)
