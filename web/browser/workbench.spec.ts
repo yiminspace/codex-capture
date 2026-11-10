@@ -135,14 +135,41 @@ test('discussion without changes explicitly skips follow-up and retains the orig
 test('a verified change shows the conditional follow-up result and decision reason', async ({ page }) => {
   const job = detail() as JobDetail;
   job.state.followupDecision = { send: true, reason: '已检测到本轮修改 src/NoteTags.tsx，发送本机跟进语句。' };
-  job.state.followupTurn = { status: 'completed', finalText: '示例便签标签复查完成，测试通过。', elapsedSeconds: 72 };
+  job.state.followupTurn = {
+    status: 'completed',
+    finalText: [
+      '[示例 PR](https://example.invalid/pull/1) 已合并。',
+      '',
+      '- **测试通过**',
+      '- 已切回 `main`',
+      '',
+      '~~~sh',
+      'git status',
+      '~~~',
+      '',
+      '[危险链接](javascript:alert%281%29)',
+      '![示例图片](https://example.invalid/tracker.png)',
+    ].join('\n'),
+    elapsedSeconds: 72,
+  };
   job.request.followup = followupPreset;
   const { calls, errors } = await setup(page, { primaryDetail: job });
   await page.goto(`/codex-capture/#token=fixture-token&job=${primary.jobId}`);
   await expect(page.locator('.followup-decision')).toContainText('跟进已完成');
   await expect(page.locator('.followup-decision')).toContainText(job.state.followupDecision.reason);
   await expect(page.locator('.stage-track li').last()).toHaveClass(/finished/);
-  await expect(page.getByText(job.state.followupTurn.finalText!)).toBeVisible();
+  const result = page.locator('.result-text').last();
+  const link = result.getByRole('link', { name: '示例 PR' });
+  await expect(link).toHaveAttribute('href', 'https://example.invalid/pull/1');
+  await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+  await expect(result.getByRole('listitem')).toHaveCount(2);
+  await expect(result.locator('strong')).toHaveText('测试通过');
+  await expect(result.locator('li code')).toHaveText('main');
+  await expect(result.locator('pre code')).toHaveText('git status');
+  await expect(result.getByRole('link', { name: '危险链接' })).toHaveCount(0);
+  await expect(result.locator('img')).toHaveCount(0);
+  await expect(page.locator('.result-text').first().locator('script')).toHaveCount(0);
+  await expect(page.locator('.result-text').first()).toContainText('<script>window.bad = true</script>');
   expect(await page.locator('.preset-text').textContent()).toBe(followupPreset);
   expect(calls.filter(call => call.startsWith('POST'))).toEqual([]);
   expect(errors).toEqual([]);

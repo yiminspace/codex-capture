@@ -3,6 +3,7 @@ import { VoyageSpinner, VoyageStateView, VoyageStatusPill, VoyageToolbar } from 
 import { action, api, downloadDiagnostic, readLaunchState, RequestGate, response, selectJobInURL } from './api';
 import { dateTime, duration, eventLabel, followupPresentation, isActive, phaseLabel, phaseTone, routeConfidence, stageLabel, timeline } from './format';
 import type { JobDetail, JobEvent, JobList, JobSummary, StatusFilter, SystemInfo } from './types';
+import { MarkdownResult } from './MarkdownResult';
 
 const iconPaths: Record<string, ReactNode> = {
   capture: <><path d="M8 3H4a1 1 0 0 0-1 1v4m13-5h4a1 1 0 0 1 1 1v4M3 16v4a1 1 0 0 0 1 1h4m8 0h4a1 1 0 0 0 1-1v-4"/><rect x="7" y="7" width="10" height="10" rx="2"/></>,
@@ -231,8 +232,8 @@ function Overview({ detail, onSettings }: { detail: JobDetail; onSettings: () =>
     <StageTrack detail={detail} />
     <Section title="你的描述"><p className="user-description">{request.text || detail.summary.text || '描述记录不可用'}</p><Screenshot jobId={detail.jobId} hasImage={Boolean(request.annotatedImage) || detail.summary.hasImage} variant={request.annotatedImage ? 'annotated-image' : 'image'} /></Section>
     <Section title="项目判断" extra={<div className="section-actions"><span className="muted">置信度 {routeConfidence(route?.confidence)}</span><button className="vg-btn" onClick={onSettings}>调整默认模型</button></div>}><p className="route-reason">{route?.reason || (isActive(detail.summary) ? '正在结合截图和上下文识别项目。' : '没有保存项目判断理由。')}</p><div className="facts"><div><span>分类模型</span><strong>{state.classifierModel || '—'}</strong></div><div><span>任务模型</span><strong>{state.actualModel || '—'}</strong></div><div><span>工作目录</span><code>{state.cwd || '—'}</code></div></div></Section>
-    {state.initialTurn?.finalText && <Section title="首轮结果"><div className="result-text">{state.initialTurn.finalText}</div></Section>}
-    <Section title="预设跟进" extra={<div className="section-actions"><span className="muted">已尝试 {state.followupAttempts || 0} 次</span><button className="vg-btn" onClick={onSettings}>编辑跟进预设</button></div>}><FollowupDecisionView detail={detail} /><blockquote className="preset-text">{request.followup?.trim() ? request.followup : '此任务未启用自动跟进。'}</blockquote>{state.followupTurn?.finalText && <div className="result-text">{state.followupTurn.finalText}</div>}</Section>
+    {state.initialTurn?.finalText && <Section title="首轮结果"><MarkdownResult text={state.initialTurn.finalText} /></Section>}
+    <Section title="预设跟进" extra={<div className="section-actions"><span className="muted">已尝试 {state.followupAttempts || 0} 次</span><button className="vg-btn" onClick={onSettings}>编辑跟进预设</button></div>}><FollowupDecisionView detail={detail} /><blockquote className="preset-text">{request.followup?.trim() ? request.followup : '此任务未启用自动跟进。'}</blockquote>{state.followupTurn?.finalText && <MarkdownResult text={state.followupTurn.finalText} />}</Section>
   </>;
 }
 
