@@ -92,7 +92,17 @@ kbd { font: 12px var(--vg-mono); color: var(--fg2); border: 1px solid var(--line
 .facts span { color: var(--fg3); font-size: 11px; }
 .facts strong, .facts code { font-size: 11.5px; color: var(--fg2); font-weight: 450; overflow-wrap: anywhere; }
 code { font-family: var(--vg-mono); }
-.result-text { font-size: 12.5px; line-height: 1.9; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fg2); }
+.result-text { font-size: 12.5px; line-height: 1.9; overflow-wrap: anywhere; color: var(--fg2); min-width: 0; overflow-x: auto; }
+.result-text :where(p, ul, ol, pre, blockquote, table, h1, h2, h3, h4, h5, h6) { margin: 0 0 .75em; }
+.result-text > :last-child { margin-bottom: 0; }
+.result-text :where(ul, ol) { padding-inline-start: 1.65em; }
+.result-text a { color: var(--accent); text-decoration: underline; }
+.result-text code { background: var(--bg2); border-radius: 4px; padding: 2px 4px; }
+.result-text pre { overflow-x: auto; padding: 10px 12px; border-radius: 6px; background: var(--bg2); }
+.result-text pre code { padding: 0; background: transparent; }
+.result-text blockquote { padding-inline-start: .8em; border-inline-start: 2px solid var(--line2); }
+.result-text table { border-collapse: collapse; }
+.result-text :where(th, td) { border: 1px solid var(--line2); padding: 4px 8px; }
 .preset-text { margin: 0 0 14px; background: var(--bg2); border-left: 2px solid var(--line2); padding: 11px 14px; font-size: 12px; line-height: 1.75; color: var(--fg2); white-space: pre-wrap; }
 .followup-decision { margin-bottom: 16px; color: var(--fg2); font-size: 12px; }
 .followup-decision p { line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
