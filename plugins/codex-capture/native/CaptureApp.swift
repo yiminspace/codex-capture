@@ -304,7 +304,11 @@ private struct CaptureMark {
 
 private final class AnnotationCanvas: NSView {
     let image: NSImage
-    var marks: [CaptureMark]
+    var marks: [CaptureMark] {
+        didSet { onMarksChanged?() }
+    }
+    var onMarksChanged: (() -> Void)?
+    var canUndo: Bool { !history.isEmpty || !marks.isEmpty }
     var tool = 0
     var ink: NSColor = .systemRed
     var stroke: CGFloat = 3
@@ -555,7 +559,13 @@ private final class CaptureHUDView: NSView {
         if bounds.contains(local), local.y > bounds.height - headerHeight, local.x < bounds.width - 36 { return self }
         return super.hitTest(point)
     }
-    override func mouseDown(with event: NSEvent) { anchor = superview?.convert(event.locationInWindow, from: nil) }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .arrow) }
+    override func mouseDown(with event: NSEvent) {
+        guard headerHeight > 0,
+              convert(event.locationInWindow, from: nil).y > bounds.height - headerHeight else { return }
+        anchor = superview?.convert(event.locationInWindow, from: nil)
+    }
+    override func mouseUp(with event: NSEvent) { anchor = nil }
     override func mouseDragged(with event: NSEvent) {
         guard let parent = superview, let anchor else { return }
         let point = parent.convert(event.locationInWindow, from: nil)
@@ -681,6 +691,80 @@ private final class CaptureSelectionView: NSView {
     }
 }
 
+private final class CaptureToolButton: NSButton {
+    static let accent = NSColor(srgbRed: 0.02, green: 0.47, blue: 0.30, alpha: 1)
+    var selected = false { didSet { needsDisplay = true } }
+    var primary = false
+    var swatch: NSColor?
+    var sampleWidth: CGFloat?
+    private var hovered = false
+
+    init(_ symbol: String, label: String, hint: String? = nil, size: CGFloat = 32) {
+        super.init(frame: .zero)
+        isBordered = false
+        imagePosition = .imageOnly
+        if !symbol.isEmpty {
+            image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)?
+                .withSymbolConfiguration(.init(pointSize: 16, weight: .medium))
+        }
+        contentTintColor = .labelColor
+        toolTip = hint ?? label
+        setAccessibilityLabel(label)
+        widthAnchor.constraint(equalToConstant: size).isActive = true
+        heightAnchor.constraint(equalToConstant: size).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas where area.owner as? CaptureToolButton === self { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.inVisibleRect, .mouseEnteredAndExited, .activeAlways],
+                                      owner: self, userInfo: nil))
+        hovered = window.map { bounds.contains(convert($0.mouseLocationOutsideOfEventStream, from: nil)) } ?? false
+        needsDisplay = true
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let pressed = isHighlighted
+        let accent = Self.accent
+        let background = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6)
+        if isEnabled {
+            if primary {
+                accent.blended(withFraction: pressed ? 0.22 : hovered ? 0.10 : 0, of: .black)?.setFill()
+                background.fill()
+            } else if selected || hovered || pressed {
+                (selected ? accent.withAlphaComponent(0.19) : NSColor.labelColor.withAlphaComponent(pressed ? 0.15 : 0.08)).setFill()
+                background.fill()
+                if selected {
+                    accent.withAlphaComponent(0.62).setStroke()
+                    background.stroke()
+                }
+            }
+        }
+        if let swatch {
+            let dot = NSBezierPath(ovalIn: NSRect(x: bounds.midX - 7, y: bounds.midY - 7, width: 14, height: 14))
+            swatch.setFill(); dot.fill()
+            NSColor.black.withAlphaComponent(0.24).setStroke(); dot.stroke()
+        } else if let sampleWidth {
+            let sample = NSBezierPath()
+            sample.move(to: NSPoint(x: bounds.midX - 6, y: bounds.midY))
+            sample.line(to: NSPoint(x: bounds.midX + 6, y: bounds.midY))
+            sample.lineCapStyle = .round
+            sample.lineWidth = sampleWidth
+            NSColor.labelColor.setStroke(); sample.stroke()
+        } else {
+            super.draw(dirtyRect)
+        }
+    }
+
+    func setSelected(_ selected: Bool) {
+        self.selected = selected
+        setAccessibilityValue(NSNumber(value: selected))
+    }
+}
+
 private final class CaptureOverlayController {
     var onComplete: ((NSImage, [CaptureMark], NSImage?) -> Void)?
     var onCancel: (() -> Void)?
@@ -689,16 +773,37 @@ private final class CaptureOverlayController {
     private var views = [CaptureSelectionView]()
     private var active: CaptureSelectionView?
     private var lastSelection: NSRect?
-    private let toolbar = CaptureHUDView(frame: NSRect(x: 0, y: 0, width: 890, height: 72))
+    private let toolbar = CaptureHUDView()
     private let infoPanel = CaptureHUDView(frame: NSRect(x: 0, y: 0, width: 330, height: 440))
-    private let tools = NSSegmentedControl(labels: ["选区", "画笔", "矩形", "圆圈", "箭头", "文字"], trackingMode: .selectOne, target: nil, action: nil)
-    private let colors = NSSegmentedControl(labels: ["红", "橙", "蓝", "绿", "黑", "白"], trackingMode: .selectOne, target: nil, action: nil)
-    private let width = NSSlider(value: 3, minValue: 1, maxValue: 10, target: nil, action: nil)
-    private let undo = NSButton(title: "撤销", target: nil, action: nil)
-    private let clear = NSButton(title: "清空", target: nil, action: nil)
-    private let complete = NSButton(title: "完成", target: nil, action: nil)
+    private let tools = [
+        CaptureToolButton("selection.pin.in.out", label: "移动或调整选区"),
+        CaptureToolButton("square", label: "矩形"),
+        CaptureToolButton("circle", label: "椭圆"),
+        CaptureToolButton("arrow.up.right", label: "箭头"),
+        CaptureToolButton("pencil", label: "画笔"),
+        CaptureToolButton("textformat", label: "文字"),
+    ]
+    private let inks: [(String, NSColor)] = [("红色", .systemRed), ("橙色", .systemOrange),
+        ("蓝色", .systemBlue), ("绿色", .systemGreen), ("黑色", .black), ("白色", .white)]
+    private let strokeWidths: [CGFloat] = [2, 4, 7]
+    private var colorButtons = [CaptureToolButton]()
+    private var widthButtons = [CaptureToolButton]()
+    private let undo = CaptureToolButton("arrow.uturn.backward", label: "撤销", hint: "撤销（⌘Z）")
+    private let clear = CaptureToolButton("trash", label: "清空标注")
+    private let complete = CaptureToolButton("checkmark", label: "完成", hint: "完成（Return）")
+    private let cancelButton = CaptureToolButton("xmark", label: "取消", hint: "取消（Esc）")
+    private let infoButton = CaptureToolButton("sidebar.right", label: "AX 信息")
+    private let selectionHint = NSTextField(labelWithString: "拖动框选截图区域")
+    private let toolGroup = NSStackView()
+    private let historyGroup = NSStackView()
+    private let mainRow = NSStackView()
+    private let palette = NSStackView()
+    private let status = NSStackView()
     private let recognitionSpinner = NSProgressIndicator()
-    private let recognitionLabel = NSTextField(labelWithString: "框选截图后识别项目")
+    private let recognitionLabel = NSTextField(labelWithString: "正在识别项目…")
+    private var selectedTool = 0
+    private var selectedColor = 0
+    private var selectedWidth = 1
     private var finishing = false
 
     init(snapshots: [(NSScreen, CGImage)], context: [String: Any]) {
@@ -717,39 +822,58 @@ private final class CaptureOverlayController {
             windows.append(window); views.append(view)
         }
         toolbar.headerHeight = 0
-        toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 8; toolbar.layer?.masksToBounds = true
-        tools.selectedSegment = 0; tools.target = self; tools.action = #selector(changeTool)
-        colors.selectedSegment = 0; colors.target = self; colors.action = #selector(changeColor)
-        width.target = self; width.action = #selector(changeWidth); width.setAccessibilityLabel("画笔粗细")
-        width.widthAnchor.constraint(equalToConstant: 76).isActive = true
-        undo.target = self; undo.action = #selector(undoMark); undo.keyEquivalent = "z"; undo.keyEquivalentModifierMask = .command
-        clear.target = self; clear.action = #selector(clearMarks)
-        complete.target = self; complete.action = #selector(finish)
-        let cancel = NSButton(title: "取消", target: self, action: #selector(cancel))
-        let ax = NSButton(title: "AX 信息", target: self, action: #selector(toggleInfo))
-        for button in [undo, clear, complete, cancel, ax] { button.bezelStyle = .rounded }
-        let stack = NSStackView(views: [tools, colors, width, undo, clear, ax, cancel, complete])
-        stack.spacing = 8; stack.orientation = .horizontal; stack.translatesAutoresizingMaskIntoConstraints = false
+        toolbar.wantsLayer = true
+        toolbar.layer?.shadowColor = NSColor.black.cgColor
+        toolbar.layer?.shadowOpacity = 0.26
+        toolbar.layer?.shadowRadius = 9
+        toolbar.layer?.shadowOffset = CGSize(width: 0, height: -3)
+
+        for (index, button) in tools.enumerated() {
+            button.tag = index
+            connect(button, #selector(changeTool(_:)))
+        }
+        connect(undo, #selector(undoMark))
+        connect(clear, #selector(clearMarks))
+        connect(infoButton, #selector(toggleInfo))
+        connect(cancelButton, #selector(cancel))
+        connect(complete, #selector(finish))
+        cancelButton.contentTintColor = .systemRed
+        complete.primary = true
+        complete.contentTintColor = .white
+        selectionHint.font = .systemFont(ofSize: 12, weight: .medium)
+
+        configure(toolGroup, with: tools + [divider()], spacing: 1)
+        configure(historyGroup, with: [undo, clear, divider()], spacing: 1)
+        configure(mainRow, with: [selectionHint, toolGroup, historyGroup, infoButton, cancelButton, complete], spacing: 2)
+
+        colorButtons = inks.enumerated().map { index, ink in
+            let button = CaptureToolButton("", label: ink.0, size: 26)
+            button.swatch = ink.1
+            button.tag = index
+            connect(button, #selector(changeColor(_:)))
+            return button
+        }
+        widthButtons = strokeWidths.enumerated().map { index, sample in
+            let button = CaptureToolButton("", label: ["细", "中", "粗"][index], size: 26)
+            button.sampleWidth = sample
+            button.tag = index
+            connect(button, #selector(changeWidth(_:)))
+            return button
+        }
+        configure(palette, with: colorButtons + [divider()] + widthButtons, spacing: 2)
+
         recognitionSpinner.style = .spinning
         recognitionSpinner.controlSize = .small
         recognitionSpinner.isDisplayedWhenStopped = false
-        recognitionSpinner.widthAnchor.constraint(equalToConstant: 16).isActive = true
-        recognitionSpinner.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        recognitionSpinner.isHidden = true
+        recognitionSpinner.widthAnchor.constraint(equalToConstant: 12).isActive = true
+        recognitionSpinner.heightAnchor.constraint(equalToConstant: 12).isActive = true
+        recognitionLabel.font = .systemFont(ofSize: 11)
+        recognitionLabel.textColor = .secondaryLabelColor
         recognitionLabel.lineBreakMode = .byTruncatingTail
-        let status = NSStackView(views: [recognitionSpinner, recognitionLabel])
-        status.spacing = 6
-        status.translatesAutoresizingMaskIntoConstraints = false
-        toolbar.addSubview(stack)
-        toolbar.addSubview(status)
-        do {
-            let content = toolbar
-            NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
-                stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
-                stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
-                status.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-                status.trailingAnchor.constraint(lessThanOrEqualTo: stack.trailingAnchor),
-                status.topAnchor.constraint(equalTo: stack.bottomAnchor, constant: 4)])
-        }
+        recognitionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        configure(status, with: [recognitionSpinner, recognitionLabel], spacing: 5)
+        for row in [mainRow, palette, status] { toolbar.addSubview(row) }
         infoPanel.title = "前景窗口 · AX 信息"
         infoPanel.wantsLayer = true; infoPanel.layer?.cornerRadius = 8; infoPanel.layer?.masksToBounds = true
         let hideInfo = NSButton(title: "×", target: self, action: #selector(toggleInfo))
@@ -780,11 +904,66 @@ private final class CaptureOverlayController {
         let scroll = NSScrollView(); scroll.documentView = info; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
         scroll.frame = NSRect(x: 1, y: 1, width: 328, height: 406)
         infoPanel.addSubview(scroll)
-        setControls(enabled: false)
+        infoPanel.isHidden = true
+        applyTool()
     }
-    private func setControls(enabled: Bool) {
-        for index in 1..<tools.segmentCount { tools.setEnabled(enabled, forSegment: index) }
-        colors.isEnabled = enabled; width.isEnabled = enabled; undo.isEnabled = enabled; clear.isEnabled = enabled; complete.isEnabled = enabled
+    private func connect(_ button: NSButton, _ action: Selector) {
+        button.target = self
+        button.action = action
+    }
+    private func configure(_ row: NSStackView, with items: [NSView], spacing: CGFloat) {
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = spacing
+        row.detachesHiddenViews = true
+        for item in items { row.addArrangedSubview(item) }
+    }
+    private func divider() -> NSView {
+        let line = NSView()
+        line.wantsLayer = true
+        line.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        line.widthAnchor.constraint(equalToConstant: 1).isActive = true
+        line.heightAnchor.constraint(equalToConstant: 17).isActive = true
+        let container = NSView()
+        container.addSubview(line)
+        line.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: 9),
+            container.heightAnchor.constraint(equalToConstant: 17),
+            line.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            line.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+        ])
+        return container
+    }
+    private func layoutToolbar() {
+        let hasSelection = active != nil
+        selectionHint.isHidden = hasSelection
+        toolGroup.isHidden = !hasSelection
+        historyGroup.isHidden = !hasSelection
+        complete.isHidden = !hasSelection
+        palette.isHidden = !hasSelection || selectedTool == 0
+        status.isHidden = !hasSelection
+        let rowWidth = ceil(mainRow.fittingSize.width)
+        let height: CGFloat = !hasSelection ? 44 : palette.isHidden ? 62 : 92
+        toolbar.setFrameSize(NSSize(width: rowWidth + 12, height: height))
+        mainRow.frame = NSRect(x: 6, y: height - 38, width: rowWidth, height: 32)
+        palette.frame = NSRect(x: 6, y: 24, width: ceil(palette.fittingSize.width), height: 26)
+        status.frame = NSRect(x: 12, y: 5, width: rowWidth - 12, height: 16)
+
+        guard let view = toolbar.superview else { return }
+        if let rect = active?.selection {
+            let below = rect.minY - height - 9
+            let above = rect.maxY + 9
+            let y = below >= 8 ? below : above + height <= view.bounds.maxY - 8 ? above : 8
+            toolbar.setFrameOrigin(NSPoint(x: max(8, min(rect.maxX - toolbar.frame.width,
+                                                        view.bounds.maxX - toolbar.frame.width - 8)), y: y))
+        } else {
+            toolbar.setFrameOrigin(NSPoint(x: max(8, floor(view.bounds.midX - toolbar.frame.width / 2)), y: 24))
+        }
+    }
+    private func updateHistoryButtons() {
+        undo.isEnabled = active?.canvas?.canUndo == true
+        clear.isEnabled = active?.canvas?.marks.isEmpty == false
     }
     func present() {
         NSApp.activate(ignoringOtherApps: true)
@@ -795,32 +974,30 @@ private final class CaptureOverlayController {
         if let view = target?.contentView {
             attachHUDs(to: view)
             infoPanel.setFrameOrigin(NSPoint(x: view.bounds.maxX - 346, y: view.bounds.maxY - 468))
-            toolbar.setFrameOrigin(NSPoint(x: max(8, view.bounds.midX - 445), y: 18))
+            layoutToolbar()
         }
     }
     private func attachHUDs(to view: NSView) {
         toolbar.removeFromSuperview(); infoPanel.removeFromSuperview()
-        view.addSubview(toolbar); view.addSubview(infoPanel)
+        view.addSubview(infoPanel); view.addSubview(toolbar)
     }
     private func selected(_ view: CaptureSelectionView, image: NSImage) {
         let selectionChanged = active !== view || lastSelection != view.selection
         lastSelection = view.selection
         for other in views where other !== view { other.discardSelection() }
-        active = view; setControls(enabled: true)
-        applyTool()
-        guard let rect = view.selection else { return }
+        active = view
+        view.canvas?.onMarksChanged = { [weak self] in self?.updateHistoryButtons() }
         let movedScreen = toolbar.superview !== view
         attachHUDs(to: view)
         if movedScreen { infoPanel.setFrameOrigin(NSPoint(x: view.bounds.maxX - 346, y: view.bounds.maxY - 468)) }
-        let below = rect.minY - toolbar.frame.height - 10
-        let y = below >= 0 ? below : min(view.bounds.maxY - toolbar.frame.height - 6, rect.maxY + 10)
-        toolbar.setFrameOrigin(NSPoint(x: max(8, min(rect.minX, view.bounds.maxX - toolbar.frame.width - 8)), y: y))
+        applyTool()
         if selectionChanged { onSelection?(image, screenRegion(for: view)) }
     }
     func updateRecognition(_ progress: RecognitionProgress) {
-        recognitionLabel.stringValue = progress.failed ? progress.title + " · " + progress.detail : progress.title
-        recognitionLabel.toolTip = recognitionLabel.stringValue
-        recognitionLabel.textColor = progress.failed ? .systemRed : .labelColor
+        recognitionLabel.stringValue = progress.title
+        recognitionLabel.toolTip = progress.failed ? progress.detail : progress.title
+        recognitionLabel.textColor = progress.failed ? .systemRed : .secondaryLabelColor
+        recognitionSpinner.isHidden = !progress.loading
         if progress.loading { recognitionSpinner.startAnimation(nil) } else { recognitionSpinner.stopAnimation(nil) }
     }
     private func screenRegion(for view: CaptureSelectionView) -> NSRect? {
@@ -829,16 +1006,30 @@ private final class CaptureOverlayController {
         return captureScreenRegion(rect, viewSize: view.bounds.size, display: CGDisplayBounds(number.uint32Value))
     }
     private func applyTool() {
-        for view in views { view.selectionTool = tools.selectedSegment == 0 }
-        active?.canvas?.tool = max(0, tools.selectedSegment - 1)
-        changeColor(); changeWidth()
+        for view in views { view.selectionTool = selectedTool == 0 }
+        let canvasTools = [0, 1, 2, 3, 0, 4]
+        active?.canvas?.tool = canvasTools[selectedTool]
+        active?.canvas?.ink = inks[selectedColor].1
+        active?.canvas?.stroke = strokeWidths[selectedWidth]
+        for button in tools { button.setSelected(button.tag == selectedTool) }
+        for button in colorButtons { button.setSelected(button.tag == selectedColor) }
+        for button in widthButtons { button.setSelected(button.tag == selectedWidth) }
+        updateHistoryButtons()
+        layoutToolbar()
     }
-    @objc private func changeTool() { applyTool(); active?.window?.makeFirstResponder(active?.canvas) }
-    @objc private func changeColor() { active?.canvas?.ink = [NSColor.systemRed, .systemOrange, .systemBlue, .systemGreen, .black, .white][colors.selectedSegment] }
-    @objc private func changeWidth() { active?.canvas?.stroke = CGFloat(width.doubleValue) }
+    @objc private func changeTool(_ sender: NSButton) {
+        selectedTool = selectedTool == sender.tag ? 0 : sender.tag
+        applyTool()
+        active?.window?.makeFirstResponder(selectedTool == 0 ? active : active?.canvas)
+    }
+    @objc private func changeColor(_ sender: NSButton) { selectedColor = sender.tag; applyTool() }
+    @objc private func changeWidth(_ sender: NSButton) { selectedWidth = sender.tag; applyTool() }
     @objc private func undoMark() { active?.canvas?.undoMark(nil) }
     @objc private func clearMarks() { active?.canvas?.clearMarks(nil) }
-    @objc private func toggleInfo() { infoPanel.isHidden.toggle() }
+    @objc private func toggleInfo() {
+        infoPanel.isHidden.toggle()
+        infoButton.setSelected(!infoPanel.isHidden)
+    }
     @objc func cancel() { guard !finishing else { return }; finishing = true; close(); onCancel?() }
     @objc private func finish() {
         guard !finishing, let view = active, let image = view.selectedImage(), let canvas = view.canvas else { return }
@@ -2103,6 +2294,9 @@ private final class CapturePreviewDelegate: NSObject, NSApplicationDelegate {
                 controller.onSubmit = { _, _ in controller.showSubmissionError("这是界面预览，不会创建任务。") }
                 controller.updateRecognition(RecognitionProgress(state: ["phase": "ready", "project": ["name": "Demo Notes"]]))
                 controller.present()
+            }
+            overlay.onSelection = { [weak overlay] _, _ in
+                overlay?.updateRecognition(RecognitionProgress(state: ["phase": "ready", "project": ["name": "Demo Notes"]]))
             }
             overlay.present()
             return
