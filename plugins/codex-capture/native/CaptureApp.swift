@@ -571,7 +571,7 @@ private final class CaptureSelectionView: NSView {
     private let background: NSImage
     private(set) var selection: NSRect?
     private(set) var canvas: AnnotationCanvas?
-    var onSelection: ((CaptureSelectionView) -> Void)?
+    var onSelection: ((CaptureSelectionView, NSImage) -> Void)?
     var selectionTool = true
     private var anchor = NSPoint.zero
     private var previousRect: NSRect?
@@ -667,7 +667,7 @@ private final class CaptureSelectionView: NSView {
         canvas.frame = rect
         addSubview(canvas); self.canvas = canvas
         needsDisplay = true
-        onSelection?(self)
+        onSelection?(self, image)
     }
     func selectedImage() -> NSImage? {
         guard let rect = selection else { return nil }
@@ -682,12 +682,14 @@ private final class CaptureSelectionView: NSView {
 }
 
 private final class CaptureOverlayController {
-    var onComplete: ((NSImage, [CaptureMark], NSImage?, NSRect?) -> Void)?
+    var onComplete: ((NSImage, [CaptureMark], NSImage?) -> Void)?
     var onCancel: (() -> Void)?
+    var onSelection: ((NSImage, NSRect?) -> Void)?
     private var windows = [CaptureOverlayWindow]()
     private var views = [CaptureSelectionView]()
     private var active: CaptureSelectionView?
-    private let toolbar = CaptureHUDView(frame: NSRect(x: 0, y: 0, width: 890, height: 46))
+    private var lastSelection: NSRect?
+    private let toolbar = CaptureHUDView(frame: NSRect(x: 0, y: 0, width: 890, height: 72))
     private let infoPanel = CaptureHUDView(frame: NSRect(x: 0, y: 0, width: 330, height: 440))
     private let tools = NSSegmentedControl(labels: ["选区", "画笔", "矩形", "圆圈", "箭头", "文字"], trackingMode: .selectOne, target: nil, action: nil)
     private let colors = NSSegmentedControl(labels: ["红", "橙", "蓝", "绿", "黑", "白"], trackingMode: .selectOne, target: nil, action: nil)
@@ -695,6 +697,8 @@ private final class CaptureOverlayController {
     private let undo = NSButton(title: "撤销", target: nil, action: nil)
     private let clear = NSButton(title: "清空", target: nil, action: nil)
     private let complete = NSButton(title: "完成", target: nil, action: nil)
+    private let recognitionSpinner = NSProgressIndicator()
+    private let recognitionLabel = NSTextField(labelWithString: "框选截图后识别项目")
     private var finishing = false
 
     init(snapshots: [(NSScreen, CGImage)], context: [String: Any]) {
@@ -705,7 +709,7 @@ private final class CaptureOverlayController {
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             window.isOpaque = true; window.backgroundColor = .black
             let view = CaptureSelectionView(snapshot: image, size: screen.frame.size)
-            view.onSelection = { [weak self] view in self?.selected(view) }
+            view.onSelection = { [weak self] view, image in self?.selected(view, image: image) }
             window.contentView = view
             window.onCancel = { [weak self] in self?.cancel() }
             window.onComplete = { [weak self] in self?.finish() }
@@ -726,12 +730,25 @@ private final class CaptureOverlayController {
         for button in [undo, clear, complete, cancel, ax] { button.bezelStyle = .rounded }
         let stack = NSStackView(views: [tools, colors, width, undo, clear, ax, cancel, complete])
         stack.spacing = 8; stack.orientation = .horizontal; stack.translatesAutoresizingMaskIntoConstraints = false
+        recognitionSpinner.style = .spinning
+        recognitionSpinner.controlSize = .small
+        recognitionSpinner.isDisplayedWhenStopped = false
+        recognitionSpinner.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        recognitionSpinner.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        recognitionLabel.lineBreakMode = .byTruncatingTail
+        let status = NSStackView(views: [recognitionSpinner, recognitionLabel])
+        status.spacing = 6
+        status.translatesAutoresizingMaskIntoConstraints = false
         toolbar.addSubview(stack)
+        toolbar.addSubview(status)
         do {
             let content = toolbar
             NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
                 stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
-                stack.centerYAnchor.constraint(equalTo: content.centerYAnchor)])
+                stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
+                status.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+                status.trailingAnchor.constraint(lessThanOrEqualTo: stack.trailingAnchor),
+                status.topAnchor.constraint(equalTo: stack.bottomAnchor, constant: 4)])
         }
         infoPanel.title = "前景窗口 · AX 信息"
         infoPanel.wantsLayer = true; infoPanel.layer?.cornerRadius = 8; infoPanel.layer?.masksToBounds = true
@@ -785,7 +802,9 @@ private final class CaptureOverlayController {
         toolbar.removeFromSuperview(); infoPanel.removeFromSuperview()
         view.addSubview(toolbar); view.addSubview(infoPanel)
     }
-    private func selected(_ view: CaptureSelectionView) {
+    private func selected(_ view: CaptureSelectionView, image: NSImage) {
+        let selectionChanged = active !== view || lastSelection != view.selection
+        lastSelection = view.selection
         for other in views where other !== view { other.discardSelection() }
         active = view; setControls(enabled: true)
         applyTool()
@@ -793,8 +812,21 @@ private final class CaptureOverlayController {
         let movedScreen = toolbar.superview !== view
         attachHUDs(to: view)
         if movedScreen { infoPanel.setFrameOrigin(NSPoint(x: view.bounds.maxX - 346, y: view.bounds.maxY - 468)) }
-        let y = rect.minY - 56 >= 0 ? rect.minY - 56 : min(view.bounds.maxY - 52, rect.maxY + 10)
+        let below = rect.minY - toolbar.frame.height - 10
+        let y = below >= 0 ? below : min(view.bounds.maxY - toolbar.frame.height - 6, rect.maxY + 10)
         toolbar.setFrameOrigin(NSPoint(x: max(8, min(rect.minX, view.bounds.maxX - toolbar.frame.width - 8)), y: y))
+        if selectionChanged { onSelection?(image, screenRegion(for: view)) }
+    }
+    func updateRecognition(_ progress: RecognitionProgress) {
+        recognitionLabel.stringValue = progress.failed ? progress.title + " · " + progress.detail : progress.title
+        recognitionLabel.toolTip = recognitionLabel.stringValue
+        recognitionLabel.textColor = progress.failed ? .systemRed : .labelColor
+        if progress.loading { recognitionSpinner.startAnimation(nil) } else { recognitionSpinner.stopAnimation(nil) }
+    }
+    private func screenRegion(for view: CaptureSelectionView) -> NSRect? {
+        guard let rect = view.selection, let screen = view.window?.screen,
+              let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+        return captureScreenRegion(rect, viewSize: view.bounds.size, display: CGDisplayBounds(number.uint32Value))
     }
     private func applyTool() {
         for view in views { view.selectionTool = tools.selectedSegment == 0 }
@@ -812,12 +844,7 @@ private final class CaptureOverlayController {
         guard !finishing, let view = active, let image = view.selectedImage(), let canvas = view.canvas else { return }
         do {
             let annotated = canvas.marks.isEmpty ? nil : try canvas.renderedImage()
-            let region = view.selection.flatMap { rect -> NSRect? in
-                guard let screen = view.window?.screen,
-                      let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
-                return captureScreenRegion(rect, viewSize: view.bounds.size, display: CGDisplayBounds(number.uint32Value))
-            }
-            finishing = true; close(); onComplete?(image, canvas.marks, annotated, region)
+            finishing = true; close(); onComplete?(image, canvas.marks, annotated)
         } catch {
             let alert = NSAlert(); alert.messageText = "截图未能导出"; alert.informativeText = error.localizedDescription
             alert.window.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 4); alert.runModal()
@@ -1302,7 +1329,8 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
 }
 
 private final class CaptureInputSession {
-    let controller: CaptureInputController
+    var controller: CaptureInputController?
+    var progress = RecognitionProgress.identifying
     let temporary: URL
     var preparationID: String?
     var stateURL: URL?
@@ -1316,9 +1344,7 @@ private final class CaptureInputSession {
     var submissionInFlight = false
     let startedAt = Date()
 
-    init(controller: CaptureInputController, temporary: URL) {
-        self.controller = controller; self.temporary = temporary
-    }
+    init(temporary: URL) { self.temporary = temporary }
 
     deinit { pollTimer?.invalidate() }
 }
@@ -1427,6 +1453,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
     private var screenCapturePermission = ScreenCapturePermissionState()
     private var inputSession: CaptureInputSession?
     private var captureOverlay: CaptureOverlayController?
+    private var selectionSession: CaptureInputSession?
     private var selectingScreenshot = false
     private let startedAt = timestamp()
 
@@ -1465,6 +1492,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
 
     func applicationWillTerminate(_ notification: Notification) {
         captureOverlay?.close()
+        discardSelectionSession()
         if let inputSession { cancelInputSession(inputSession) }
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
@@ -1653,8 +1681,8 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         do { try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
         catch { fail(error, temporary: nil); return }
         let screenshot = temporary.appendingPathComponent("screenshot.png")
-        inputSession?.controller.closeAnnotationEditor()
-        inputSession?.controller.window?.orderOut(nil)
+        inputSession?.controller?.closeAnnotationEditor()
+        inputSession?.controller?.window?.orderOut(nil)
         if #available(macOS 14.0, *) {
             captureDisplaySnapshots { [weak self] result in
                 guard let self else { return }
@@ -1669,26 +1697,22 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                     self.captureOverlay = overlay
                     overlay.onCancel = { [weak self] in
                         guard let self else { return }
-                        self.captureOverlay = nil; self.state = "ready"; self.finishCapture(temporary: temporary)
+                        self.captureOverlay = nil; self.discardSelectionSession(); self.state = "ready"; self.finishCapture(temporary: temporary)
                         if self.inputSession == nil { _ = source?.activate(options: []) }
                     }
-                    overlay.onComplete = { [weak self] image, marks, annotated, region in
+                    overlay.onSelection = { [weak self] image, region in
+                        self?.prepareSelection(image: image, region: region, context: context)
+                    }
+                    overlay.onComplete = { [weak self] image, marks, annotated in
                         guard let self else { return }
                         self.captureOverlay = nil
-                        do {
-                            guard let bitmap = image.representations.first as? NSBitmapImageRep,
-                                  let data = bitmap.representation(using: .png, properties: [:]) else {
-                                throw NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "无法保存截图。"])
-                            }
-                            try data.write(to: screenshot, options: .atomic)
-                            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: screenshot.path)
-                            var evidence = context
-                            if let region, let bounds = context["windowBounds"] as? [CGFloat], bounds.count == 4 {
-                                let window = NSRect(x: bounds[0], y: bounds[1], width: bounds[2], height: bounds[3])
-                                evidence["foregroundOverlap"] = window.contains(region) ? "inside" : (window.intersects(region) ? "partial" : "outside")
-                            }
-                            self.askDescription(screenshot: screenshot, context: evidence, temporary: temporary, marks: marks, annotated: annotated)
-                        } catch { self.fail(error, temporary: temporary) }
+                        guard let session = self.selectionSession else {
+                            self.finishCapture(temporary: temporary)
+                            return
+                        }
+                        self.selectionSession = nil
+                        try? FileManager.default.removeItem(at: temporary)
+                        self.showDescription(image: image, session: session, marks: marks, annotated: annotated)
                     }
                     overlay.present()
                 }
@@ -1715,33 +1739,61 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         }
     }
 
-    private func askDescription(screenshot: URL, context: [String: Any], temporary: URL, marks: [CaptureMark] = [], annotated: NSImage? = nil) {
-        selectingScreenshot = false
+    private func prepareSelection(image: NSImage, region: NSRect?, context: [String: Any]) {
+        discardSelectionSession()
+        let session = CaptureInputSession(temporary: FileManager.default.temporaryDirectory.appendingPathComponent("codex-capture-" + UUID().uuidString))
+        selectionSession = session
+        captureOverlay?.updateRecognition(.identifying)
+        var evidence = context
+        if let region, let bounds = evidence.removeValue(forKey: "windowBounds") as? [CGFloat], bounds.count == 4 {
+            let window = NSRect(x: bounds[0], y: bounds[1], width: bounds[2], height: bounds[3])
+            evidence["foregroundOverlap"] = window.contains(region) ? "inside" : (window.intersects(region) ? "partial" : "outside")
+        }
+        guard let bitmap = image.representations.first as? NSBitmapImageRep, let pixels = bitmap.cgImage else {
+            session.preparationReturned = true
+            preparationFailed(session, message: "无法读取截图。")
+            return
+        }
+        let screenshot = session.temporary.appendingPathComponent("screenshot.png")
+        startPreparation(session, screenshot: screenshot, context: evidence, pixels: pixels)
+    }
+
+    private func discardSelectionSession() {
+        guard let session = selectionSession else { return }
+        selectionSession = nil
+        discardSession(session)
+    }
+
+    private func askDescription(screenshot: URL, context: [String: Any], temporary: URL) {
         guard let image = NSImage(contentsOf: screenshot) else {
             fail(NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "无法读取本次截图，请重新截图。"]), temporary: temporary)
             return
         }
-        let contextFile = temporary.appendingPathComponent("context.json")
-        var evidence = context
-        evidence.removeValue(forKey: "windowBounds")
-        do { try writeJSON(evidence, to: contextFile) }
-        catch { fail(error, temporary: temporary); return }
+        let session = CaptureInputSession(temporary: temporary)
+        showDescription(image: image, session: session)
+        startPreparation(session, screenshot: screenshot, context: context)
+    }
+
+    private func showDescription(image: NSImage, session: CaptureInputSession, marks: [CaptureMark] = [], annotated: NSImage? = nil) {
+        selectingScreenshot = false
         let controller: CaptureInputController
-        if let previous = inputSession {
-            controller = previous.controller
+        if let previous = inputSession, let existing = previous.controller {
+            controller = existing
             cancelInputSession(previous, dismissWindow: false)
             controller.replaceScreenshot(image)
         } else {
             controller = CaptureInputController(image: image)
         }
         controller.applyAnnotations(marks, image: annotated)
-        let session = CaptureInputSession(controller: controller, temporary: temporary)
+        session.controller = controller
+        controller.updateRecognition(session.progress)
+        if let stateURL = session.stateURL { controller.updateDebug(directory: stateURL.deletingLastPathComponent()) }
         inputSession = session
-        controller.onSubmit = { [weak self, weak session] text, startConversation in
+        controller.onSubmit = { [weak self, weak session, weak controller] text, startConversation in
             guard let self, let session, self.inputSession === session else { return }
             session.pendingDescription = text
             session.startConversation = startConversation
-            session.controller.setSubmitting(true, awaitingPreparation: session.preparationID == nil, startConversation: startConversation)
+            controller?.setSubmitting(true, awaitingPreparation: session.preparationID == nil, startConversation: startConversation)
             self.state = "submitting"; self.writeStatus()
             self.submitPreparedSession(session)
         }
@@ -1751,15 +1803,30 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         }
         state = "awaiting_description"; writeStatus()
         controller.present()
-        // The window is already editable while the short CLI call starts a
-        // detached classifier. No user description is needed for this stage.
+    }
+
+    private func startPreparation(_ session: CaptureInputSession, screenshot: URL, context: [String: Any], pixels: CGImage? = nil) {
+        let temporary = session.temporary
+        let contextFile = temporary.appendingPathComponent("context.json")
+        var evidence = context
+        evidence.removeValue(forKey: "windowBounds")
+        let captureContext = evidence
         DispatchQueue.global(qos: .userInitiated).async {
             do {
+                if let pixels {
+                    try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                    guard let data = NSBitmapImageRep(cgImage: pixels).representation(using: .png, properties: [:]) else {
+                        throw NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "无法保存截图。"])
+                    }
+                    try data.write(to: screenshot, options: .atomic)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: screenshot.path)
+                }
+                try writeJSON(captureContext, to: contextFile)
                 let result = try command(launcherURL.path, ["prepare", "--image", screenshot.path, "--context-file", contextFile.path], timeout: 30)
                 let prepared = preparationReply(result.output)
                 DispatchQueue.main.async {
                     session.preparationReturned = true
-                    guard self.inputSession === session, !session.cancelled else {
+                    guard self.isCurrentSession(session) else {
                         if let prepared { self.discardPreparation(prepared.id) }
                         try? FileManager.default.removeItem(at: temporary)
                         return
@@ -1781,7 +1848,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
             } catch {
                 DispatchQueue.main.async {
                     session.preparationReturned = true
-                    guard self.inputSession === session, !session.cancelled else {
+                    guard self.isCurrentSession(session) else {
                         try? FileManager.default.removeItem(at: temporary)
                         return
                     }
@@ -1791,19 +1858,29 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         }
     }
 
+    private func isCurrentSession(_ session: CaptureInputSession) -> Bool {
+        !session.cancelled && (inputSession === session || selectionSession === session)
+    }
+
+    private func updateRecognition(_ session: CaptureInputSession, _ progress: RecognitionProgress) {
+        session.progress = progress
+        session.controller?.updateRecognition(progress)
+        if selectionSession === session { captureOverlay?.updateRecognition(progress) }
+    }
+
     private func preparationFailed(_ session: CaptureInputSession, message: String) {
-        guard inputSession === session else { return }
+        guard isCurrentSession(session) else { return }
         session.pendingDescription = nil
         session.preparationFinished = true
         session.pollTimer?.invalidate(); session.pollTimer = nil
         if let preparationID = session.preparationID { discardPreparation(preparationID) }
-        session.controller.setSubmitting(false)
-        session.controller.updateRecognition(RecognitionProgress(title: "项目识别未完成", detail: message, loading: false, failed: true))
-        lastError = message; state = "awaiting_description"; writeStatus()
+        session.controller?.setSubmitting(false)
+        updateRecognition(session, RecognitionProgress(title: "项目识别未完成", detail: message, loading: false, failed: true))
+        if inputSession === session { lastError = message; state = "awaiting_description"; writeStatus() }
     }
 
     private func startPreparationPolling(_ session: CaptureInputSession) {
-        guard inputSession === session, !session.cancelled, !session.submissionInFlight, !session.preparationFinished else { return }
+        guard isCurrentSession(session), !session.submissionInFlight, !session.preparationFinished else { return }
         pollPreparation(session)
         guard !session.preparationFinished, session.pollTimer == nil else { return }
         let timer = Timer(timeInterval: 0.35, repeats: true) { [weak self, weak session] _ in
@@ -1815,7 +1892,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
     }
 
     private func pollPreparation(_ session: CaptureInputSession) {
-        guard inputSession === session, !session.cancelled, !session.submissionInFlight, let stateURL = session.stateURL else { return }
+        guard isCurrentSession(session), !session.submissionInFlight, let stateURL = session.stateURL else { return }
         func readRecord() -> [String: Any]? {
             guard let info = try? stateURL.resourceValues(forKeys: [.fileSizeKey, .isSymbolicLinkKey]),
                   info.isSymbolicLink != true, let size = info.fileSize, size <= 1_048_576,
@@ -1829,7 +1906,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
             }
             return
         }
-        session.controller.updateDebug(directory: stateURL.deletingLastPathComponent())
+        session.controller?.updateDebug(directory: stateURL.deletingLastPathComponent())
         var progress = RecognitionProgress(state: record)
         if progress.loading, let pid = record["workerPid"] as? Int ?? session.preparationWorkerPID,
            pid <= 1 || pid > Int(Int32.max) || kill(pid_t(pid), 0) != 0 {
@@ -1841,13 +1918,13 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                 return
             }
         }
-        session.controller.updateRecognition(progress)
+        updateRecognition(session, progress)
         if !progress.loading {
             session.preparationFinished = true
             session.pollTimer?.invalidate(); session.pollTimer = nil
-            if progress.failed && !session.submissionInFlight {
+            if progress.failed && inputSession === session {
                 session.pendingDescription = nil
-                session.controller.setSubmitting(false)
+                session.controller?.setSubmitting(false)
                 lastError = progress.detail; state = "awaiting_description"; writeStatus()
             }
         } else if record["workerPid"] == nil && session.preparationWorkerPID == nil && Date().timeIntervalSince(session.startedAt) > 10 {
@@ -1859,20 +1936,21 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
 
     private func submitPreparedSession(_ session: CaptureInputSession) {
         guard inputSession === session, !session.cancelled, !session.submissionInFlight,
-              let preparationID = session.preparationID, let text = session.pendingDescription else { return }
+              let controller = session.controller, let preparationID = session.preparationID,
+              let text = session.pendingDescription else { return }
         let annotatedURL = session.temporary.appendingPathComponent("annotated.png")
         let annotationPath: String?
-        do { annotationPath = try session.controller.writeAnnotatedImage(to: annotatedURL) ? annotatedURL.path : nil }
+        do { annotationPath = try controller.writeAnnotatedImage(to: annotatedURL) ? annotatedURL.path : nil }
         catch {
             session.pendingDescription = nil
-            session.controller.showSubmissionError("无法保存标注图。" + error.localizedDescription)
+            controller.showSubmissionError("无法保存标注图。" + error.localizedDescription)
             state = "awaiting_description"; writeStatus()
             return
         }
         session.submissionInFlight = true
         session.pollTimer?.invalidate(); session.pollTimer = nil
         let startConversation = session.startConversation
-        session.controller.setSubmitting(true, startConversation: startConversation)
+        controller.setSubmitting(true, startConversation: startConversation)
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let result = try command(launcherURL.path, submissionArguments(preparationID: preparationID, text: text, annotatedImage: annotationPath, startConversation: startConversation), timeout: 30)
@@ -1884,7 +1962,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                           let reply = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                           let job = reply["jobId"] as? String else {
                         session.pendingDescription = nil
-                        session.controller.showSubmissionError("提交失败，描述已保留。" + String(result.output.prefix(1000)))
+                        controller.showSubmissionError("提交失败，描述已保留。" + String(result.output.prefix(1000)))
                         self.startPreparationPolling(session)
                         self.state = "awaiting_description"; self.writeStatus()
                         return
@@ -1892,7 +1970,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                     self.lastJob = job; self.state = "ready"
                     self.latestJob = JobSummary(id: job, phase: "queued", project: "", createdAt: timestamp())
                     session.pollTimer?.invalidate()
-                    session.controller.dismiss()
+                    session.controller?.dismiss()
                     self.inputSession = nil
                     self.finishCapture(temporary: session.temporary)
                     self.refreshJobProgress()
@@ -1905,7 +1983,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                 DispatchQueue.main.async {
                     guard self.inputSession === session, !session.cancelled else { return }
                     session.submissionInFlight = false; session.pendingDescription = nil
-                    session.controller.showSubmissionError("提交失败，描述已保留。" + error.localizedDescription)
+                    controller.showSubmissionError("提交失败，描述已保留。" + error.localizedDescription)
                     self.startPreparationPolling(session)
                     self.state = "awaiting_description"; self.writeStatus()
                 }
@@ -1933,19 +2011,19 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
 
     private func cancelInputSession(_ session: CaptureInputSession, dismissWindow: Bool = true) {
         guard inputSession === session, !session.submissionInFlight else { return }
-        session.cancelled = true
-        session.pollTimer?.invalidate(); session.pollTimer = nil
-        if dismissWindow { session.controller.dismiss() }
-        if let preparationID = session.preparationID { discardPreparation(preparationID) }
+        if dismissWindow { session.controller?.dismiss() }
+        discardSession(session)
         inputSession = nil
         state = "ready"
-        // prepare may still be copying these inputs. Its completion callback
-        // owns cleanup until the command has returned, even after this closes.
-        if dismissWindow {
-            finishCapture(temporary: session.preparationReturned ? session.temporary : nil)
-        } else if session.preparationReturned {
-            try? FileManager.default.removeItem(at: session.temporary)
-        }
+        if dismissWindow { finishCapture() }
+    }
+
+    private func discardSession(_ session: CaptureInputSession) {
+        session.cancelled = true
+        session.pollTimer?.invalidate(); session.pollTimer = nil
+        if let preparationID = session.preparationID { discardPreparation(preparationID) }
+        // An in-flight prepare owns cleanup until it finishes copying the inputs.
+        if session.preparationReturned { try? FileManager.default.removeItem(at: session.temporary) }
     }
 
     private func fail(_ error: Error, temporary: URL?) {
@@ -1959,7 +2037,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         if let inputSession {
             state = "awaiting_description"
             busy = true
-            inputSession.controller.present()
+            inputSession.controller?.present()
         } else {
             busy = false
         }
@@ -2017,7 +2095,7 @@ private final class CapturePreviewDelegate: NSObject, NSApplicationDelegate {
             let overlay = CaptureOverlayController(snapshots: [(screen, bitmap)], context: context)
             self.overlay = overlay
             overlay.onCancel = { NSApp.terminate(nil) }
-            overlay.onComplete = { [weak self] image, marks, annotated, _ in
+            overlay.onComplete = { [weak self] image, marks, annotated in
                 let controller = CaptureInputController(image: image)
                 controller.applyAnnotations(marks, image: annotated)
                 self?.controller = controller; self?.overlay = nil
