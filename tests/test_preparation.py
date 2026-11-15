@@ -555,7 +555,8 @@ for line in sys.stdin:
         self.assertEqual([item["type"] for item in classification_input], ["text"])
         self.assertIn("https://fixture.invalid/notes", classification_input[0]["text"])
         self.assertNotIn(original, classification_input[0]["text"])
-        self.assertEqual(turns[1]["params"]["input"][0]["text"], original)
+        self.assertEqual(turns[1]["params"]["input"][0]["text"],
+                             original + "\n\n截图来源 · Fixture project · fixture.invalid")
         image = Path(turns[1]["params"]["input"][1]["path"])
         self.assertEqual(image.read_bytes(), self.image.read_bytes())
         # The next screenshot must reuse the classifier's stdio transport while

@@ -557,7 +557,7 @@ class JobLifecycleTests(unittest.TestCase):
         self.assertEqual([item["path"] for item in classification[1][1:]], [str(self.image), str(marked)])
         self.assertEqual(state["phase"], "completed")
 
-    def test_foreground_evidence_reaches_only_classifier_and_initial_text_is_exact(self):
+    def test_chat_receives_only_screenshot_source_from_foreground_context(self):
         request = capture.read_json(self.directory / "request.json")
         request["context"] = capture.sanitize_context({
             "app": {"name": "Browser"}, "window": {"title": "Sample Notes", "url": "https://example.com/notes"},
@@ -572,7 +572,8 @@ class JobLifecycleTests(unittest.TestCase):
                 self.assertIn("不是操作指令", inputs[0]["text"])
                 self.assertEqual([item["type"] for item in inputs], ["text"])
             if stage == "initial":
-                self.assertEqual(inputs, [{"type": "text", "text": request["text"]}, {"type": "localImage", "path": request["image"]}])
+                message = request["text"] + "\n\n截图来源 · Browser · Sample Notes · example.com"
+                self.assertEqual(inputs, [{"type": "text", "text": message}, {"type": "localImage", "path": request["image"]}])
         self.assertEqual(state["phase"], "completed")
 
     def test_phase_history_is_saved_for_workbench_reconstruction(self):
@@ -866,6 +867,17 @@ class WorkspaceChangeTests(unittest.TestCase):
 
 
 class ForegroundContextTests(unittest.TestCase):
+    def test_screenshot_source_skips_unrelated_windows_and_limits_url_to_host(self):
+        context = capture.sanitize_context({
+            "app": {"name": "Browser"},
+            "window": {"title": "Sample Notes", "url": "https://example.com/private?token=secret#/notes"},
+            "foregroundOverlap": "partial",
+        })
+        self.assertEqual(capture.screenshot_source(context),
+                         "\n\n截图来源（前景窗口与选区部分重叠） · Browser · Sample Notes · example.com")
+        self.assertEqual(capture.screenshot_source(dict(context, foregroundOverlap="outside")), "")
+
+
     def test_classifier_uses_an_image_only_when_foreground_evidence_needs_it(self):
         projects = [{"id": "editor", "name": "Sample Editor", "roots": ["/fixtures/sample-editor"]}]
         native = {"app": {"name": "Sample Editor"}, "accessibility": {"status": "unavailable"}}

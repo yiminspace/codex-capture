@@ -230,6 +230,19 @@ def load_context(path):
     return sanitize_context(json.loads(payload))
 
 
+def screenshot_source(context):
+    if not context or context.get("foregroundOverlap") == "outside":
+        return ""
+    window = context.get("window") or {}
+    host = urlsplit(window.get("url") or "").hostname
+    parts = [(context.get("app") or {}).get("name"), window.get("title"), host]
+    labels = list(dict.fromkeys(" ".join(value.split()) for value in parts if value and value.strip()))
+    if not labels:
+        return ""
+    label = "截图来源（前景窗口与选区部分重叠）" if context.get("foregroundOverlap") == "partial" else "截图来源"
+    return "\n\n" + label + " · " + " · ".join(labels)
+
+
 def context_prompt(context):
     if not context:
         return ""
@@ -1321,9 +1334,8 @@ def run_job(job_id):
                 raise NeedsInput("Codex 未确认 Full access 权限，任务尚未开始；请查看调试记录中的 permissions，检查 Codex 版本或权限要求后重新提交。")
             save("starting_initial")
             server.request("thread/name/set", {"threadId": thread_id, "name": "截图任务 · " + route["title"][:70]})
-            # The target chat receives exactly the user's message and original image.
-            # Foreground evidence is solely an input to project classification.
-            inputs = [{"type": "text", "text": request["text"]}, {"type": "localImage", "path": request["image"]}]
+            message = request["text"] + screenshot_source(request.get("context"))
+            inputs = [{"type": "text", "text": message}, {"type": "localImage", "path": request["image"]}]
             if request.get("annotatedImage"):
                 inputs.append({"type": "localImage", "path": request["annotatedImage"]})
             if start_conversation:
