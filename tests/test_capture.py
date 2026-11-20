@@ -380,7 +380,7 @@ class RouteTests(unittest.TestCase):
 
 
 class FakeJobServer:
-    def __init__(self, directory, project, *, initial_status="completed", confidence=0.99, fail_followup=False, initial_action=None, permission_response=None):
+    def __init__(self, directory, project, *, initial_status="completed", confidence=0.99, fail_followup=False, initial_action=None, permission_response=None, model_pages=None):
         self.directory = directory
         self.project = project
         self.initial_status = initial_status
@@ -388,6 +388,7 @@ class FakeJobServer:
         self.fail_followup = fail_followup
         self.initial_action = initial_action
         self.permission_response = permission_response
+        self.model_pages = model_pages
         self.info = {"userAgent": "fake-job"}
         self.process = mock.Mock(pid=321)
         self.requests = []
@@ -399,9 +400,11 @@ class FakeJobServer:
 
     def request(self, method, params):
         self.requests.append((method, params))
+        if method == "model/list":
+            return self.model_pages[params["cursor"]]
         if method == "thread/start":
             full_access = params.get("permissions") == ":danger-full-access"
-            result = {"thread": {"id": "classifier" if params.get("ephemeral") else "main-thread", "projectId": params.get("projectId")}, "model": "default-main-model",
+            result = {"thread": {"id": "classifier" if params.get("ephemeral") else "main-thread", "projectId": params.get("projectId")}, "model": params.get("model", "default-main-model"),
                       "activePermissionProfile": {"id": ":danger-full-access"} if full_access else None,
                       "sandbox": {"type": "dangerFullAccess" if full_access else "readOnly"},
                       "approvalPolicy": "never", "approvalsReviewer": "user"}
@@ -522,6 +525,27 @@ class JobLifecycleTests(unittest.TestCase):
         with mock.patch.object(capture, "AppServer") as factory:
             capture.run_job(self.job_id)
         factory.assert_not_called()
+
+    def test_auto_sol_selects_latest_visible_release_across_pages(self):
+        request_path = self.directory / "request.json"
+        capture.atomic_json(request_path, {**capture.read_json(request_path), "model": "auto-sol"})
+        server, state = self.execute(model_pages={
+            None: {"data": [{"model": "gpt-6.9-sol"}, {"model": "gpt-7-sol", "hidden": True}], "nextCursor": "next"},
+            "next": {"data": [{"model": "gpt-6.10-sol"}, {"model": "gpt-8-sol-preview"}, {"model": "gpt-9-luna"}]},
+        })
+        starts = [params for method, params in server.requests if method == "thread/start"]
+        self.assertEqual(starts[0]["model"], "gpt-6-luna")
+        self.assertEqual(starts[1]["model"], "gpt-6.10-sol")
+        self.assertEqual(state["actualModel"], "gpt-6.10-sol")
+        self.assertEqual(state["phase"], "completed")
+
+    def test_auto_sol_without_supported_model_does_not_start_task(self):
+        request_path = self.directory / "request.json"
+        capture.atomic_json(request_path, {**capture.read_json(request_path), "model": "auto-sol"})
+        server, state = self.execute(model_pages={None: {"data": [{"model": "gpt-6-luna"}]}})
+        self.assertEqual(state["phase"], "needs_input")
+        self.assertIn("Sol", state["error"])
+        self.assertEqual([stage for _, _, stage in server.turns], ["classification"])
 
     def test_unconfirmed_full_access_never_sends_initial_or_followup(self):
         overrides = [
