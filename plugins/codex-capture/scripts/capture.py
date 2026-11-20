@@ -27,6 +27,7 @@ DATA = Path(os.environ.get("CODEX_CAPTURE_DATA", Path.home() / ".local/state/cod
 
 
 DEFAULT_SETTINGS = {"classifierModel": "gpt-6-luna", "taskModel": ""}
+AUTO_SOL = "auto-sol"
 
 
 def read_settings(root=None):
@@ -324,6 +325,26 @@ class NeedsInput(RuntimeError):
 
 class Cancelled(RuntimeError):
     pass
+
+
+def latest_sol_model(server):
+    """Choose the newest stable Sol model listed by this App Server."""
+    cursor = None
+    candidates = []
+    while True:
+        page = server.request("model/list", {"limit": 100, "cursor": cursor})
+        for model in page["data"]:
+            name = model["model"]
+            match = re.fullmatch(r"gpt-(\d+(?:\.\d+)*)-sol", name)
+            if match and not model.get("hidden"):
+                version = tuple(map(int, match[1].split(".")))
+                candidates.append((version, name))
+        cursor = page.get("nextCursor")
+        if not cursor:
+            break
+    if not candidates:
+        raise NeedsInput("当前 Codex 模型列表没有可用的正式版 Sol 模型。请检查 Codex CLI 和账号，或在默认设置中指定任务模型。")
+    return max(candidates)[1]
 
 
 class AppServer:
@@ -1310,8 +1331,11 @@ def run_job(job_id):
                 # with '/' writable still protects paths such as .git and is
                 # displayed as Custom by the desktop, not Full access.
                 params.update(approvalPolicy="never", permissions=":danger-full-access")
-            if request.get("model"):
-                params["model"] = request["model"]
+            model = request.get("model")
+            if model == AUTO_SOL:
+                model = latest_sol_model(server)
+            if model:
+                params["model"] = model
             created = server.request("thread/start", params)
             thread_id = created["thread"]["id"]
             permission_state = {
@@ -1536,7 +1560,7 @@ def main():
         p.add_argument("--annotated-image", help="可选：保留原图并附加标注图")
         p.add_argument("--context-file", help="可选：截图前保存的前景窗口 JSON 上下文")
         p.add_argument("--followup", help="覆盖本机跟进预设；传入空字符串可禁用自动跟进")
-        p.add_argument("--model", help="主任务模型；不指定时使用本机设置或 Codex 默认配置")
+        p.add_argument("--model", help="主任务模型；auto-sol 自动选择最新 Sol，不指定时使用本机设置或 Codex 默认配置")
         p.add_argument("--no-open", action="store_true", help="兼容旧调用；任务结束后始终不自动打开桌面 chat")
         p.add_argument("--read-only", action="store_true")
     p = sub.add_parser("prepare", help="截图后立即在后台识别项目")

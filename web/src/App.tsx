@@ -298,8 +298,9 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
     <div className="settings-heading"><div><h2 id="settings-title">默认设置</h2><p>保存后用于后续任务，历史记录保留实际使用的配置。</p></div><button className="vg-btn" disabled={busy} onClick={onClose}>关闭</button></div>
     {!settings ? <p>{error || '正在读取设置…'}</p> : <form onSubmit={event => { event.preventDefault(); void save(); }}>
       <div className="settings-models"><label>分类模型<input required value={settings.classifierModel} list="capture-models" maxLength={128} onChange={event => update('classifierModel', event.target.value)} /><span>用于识别截图所属项目，新截图生效。</span></label>
-      <label>任务模型<input value={settings.taskModel} list="capture-models" maxLength={128} placeholder="留空使用 Codex 默认模型" onChange={event => update('taskModel', event.target.value)} /><span>用于正式执行任务，留空沿用 Codex 配置。</span></label></div>
+      <label>任务模型<input value={settings.taskModel} list="capture-task-models" maxLength={128} placeholder="留空使用 Codex 默认模型" onChange={event => update('taskModel', event.target.value)} /><span>auto-sol 自动选择最新 Sol，留空沿用 Codex 配置。</span></label></div>
       <datalist id="capture-models"><option value="gpt-6-luna" /><option value="gpt-6.1-sol" /></datalist>
+      <datalist id="capture-task-models"><option value="auto-sol" label="自动选择最新 Sol" /><option value="gpt-6.1-sol" /></datalist>
       <label>跟进预设<textarea rows={10} value={settings.followup} onChange={event => update('followup', event.target.value)} /><span>首轮产生代码改动时自动跟进一次。清空可禁用。</span></label>
       <div className="settings-footer"><span role="status" className={error ? 'inline-error' : 'muted'}>{error || (saved ? '已保存，后续任务生效。' : '模型 ID 可直接输入；可用性以当前账号为准。')}</span><button className="vg-btn vg-btn-primary" disabled={busy} type="submit">{busy ? '保存中…' : '保存设置'}</button></div>
     </form>}
