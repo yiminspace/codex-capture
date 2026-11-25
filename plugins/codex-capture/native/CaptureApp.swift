@@ -46,6 +46,36 @@ private func validDescription(_ text: String) -> Bool {
     !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.count <= 5_000
 }
 
+private struct ProjectChoice: Equatable {
+    let id: String
+    let name: String
+    let root: String
+
+    var label: String { name + "  ·  " + (root as NSString).abbreviatingWithTildeInPath }
+
+    static func decode(_ data: Data) -> [ProjectChoice]? {
+        guard let projects = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+        return projects.flatMap { project -> [ProjectChoice] in
+            guard let id = project["id"] as? String, let name = project["name"] as? String,
+                  let roots = project["roots"] as? [String] else { return [] }
+            return roots.map { ProjectChoice(id: id, name: name, root: $0) }
+        }
+    }
+
+    func matches(_ query: String) -> Bool {
+        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        let source = label.folding(options: options, locale: .current)
+        return query.folding(options: options, locale: .current).split(whereSeparator: \.isWhitespace).allSatisfy { word in
+            var remaining = source[...]
+            for character in word {
+                guard let index = remaining.firstIndex(of: character) else { return false }
+                remaining = remaining[remaining.index(after: index)...]
+            }
+            return true
+        }
+    }
+}
+
 private struct RecognitionProgress: Equatable {
     let title: String
     let detail: String
@@ -54,26 +84,30 @@ private struct RecognitionProgress: Equatable {
 
     static let identifying = RecognitionProgress(title: "正在识别项目…", detail: "你可以同时输入需求。", loading: true, failed: false)
 
-    init(state: [String: Any]) {
+    init(state: [String: Any], manual: Bool = false) {
         switch state["phase"] as? String ?? "" {
-        case "queued", "connecting", "classifying": self = .identifying
+        case "queued", "connecting", "classifying":
+            self = manual ? .checkingProject : .identifying
         case "ready":
             let name = (state["project"] as? [String: Any])?["name"] as? String ?? ""
             if name.isEmpty {
-                self.init(title: "无法确认项目", detail: "识别结果缺少项目名称，请取消后重新截图。", loading: false, failed: true)
+                self.init(title: "无法确认项目", detail: "识别结果缺少项目名称。", loading: false, failed: true)
             } else {
-                self.init(title: "项目：" + name, detail: "开始后将在这个项目执行任务。", loading: false, failed: false)
+                self.init(title: "项目：" + name, detail: manual ? "已手动指定，开始后将在这个项目执行任务。" : "开始后将在这个项目执行任务。", loading: false, failed: false)
             }
         case "needs_input", "failed", "cancelled":
-            self.init(title: "项目识别未完成", detail: String((state["error"] as? String ?? "请取消后重新截图。").prefix(500)), loading: false, failed: true)
+            self.init(title: manual ? "无法确认手动指定的项目" : "项目识别未完成",
+                      detail: String((state["error"] as? String ?? "可以重试或手动指定项目。").prefix(500)), loading: false, failed: true)
         default:
-            self.init(title: "项目状态不可用", detail: "请取消后重新截图。", loading: false, failed: true)
+            self.init(title: "项目状态不可用", detail: "可以重试或手动指定项目。", loading: false, failed: true)
         }
     }
 
     init(title: String, detail: String, loading: Bool, failed: Bool) {
         self.title = title; self.detail = detail; self.loading = loading; self.failed = failed
     }
+
+    static let checkingProject = RecognitionProgress(title: "正在核对项目…", detail: "你可以同时输入需求。", loading: true, failed: false)
 }
 
 private func preparationReply(_ output: String) -> (id: String, stateURL: URL, workerPID: Int?)? {
@@ -1108,9 +1142,10 @@ private func captureDisplaySnapshots(_ completion: @escaping (Result<[(NSScreen,
     DispatchQueue.main.async { DisplaySnapshotReader(completion: completion).start() }
 }
 
-private final class CaptureInputController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
+private final class CaptureInputController: NSWindowController, NSWindowDelegate, NSTextViewDelegate, NSComboBoxDataSource, NSComboBoxDelegate {
     var onSubmit: ((String, Bool) -> Void)?
     var onCancel: (() -> Void)?
+    var onResolveProject: ((ProjectChoice?) -> Void)?
     private let textView = NSTextView()
     private let preview = NSImageView()
     private var originalImage: NSImage
@@ -1122,6 +1157,13 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
     private let statusIcon = NSImageView()
     private let projectLabel = NSTextField(labelWithString: RecognitionProgress.identifying.title)
     private let detailLabel = NSTextField(wrappingLabelWithString: RecognitionProgress.identifying.detail)
+    private let retryButton = NSButton(title: "重新识别", target: nil, action: nil)
+    private let projectField = NSComboBox()
+    private var projectChoices: [ProjectChoice] = []
+    private var matchingProjects: [ProjectChoice] = []
+    private let confirmProjectButton = NSButton(title: "使用此项目", target: nil, action: nil)
+    private let recoveryRow = NSStackView()
+    private var recoveryHeight: NSLayoutConstraint!
     private let submissionHint = "⌘ Return 快捷完成 · Return 换行\n开始会话会直接打开 Codex，跳过预设跟进"
     private let messageLabel = NSTextField(wrappingLabelWithString: "")
     private let startButton = NSButton(title: "快捷完成", target: nil, action: nil)
@@ -1215,6 +1257,24 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
         ])
         let recognition = NSStackView(views: [iconArea, projectText])
         recognition.orientation = .horizontal; recognition.alignment = .top; recognition.spacing = 9
+        retryButton.bezelStyle = .rounded
+        retryButton.target = self; retryButton.action = #selector(retryRecognition)
+        projectField.placeholderString = "搜索项目名或目录"
+        projectField.setAccessibilityLabel("手动指定项目")
+        projectField.lineBreakMode = .byTruncatingMiddle
+        projectField.usesDataSource = true
+        projectField.dataSource = self
+        projectField.delegate = self
+        projectField.numberOfVisibleItems = 8
+        projectField.target = self; projectField.action = #selector(confirmProject)
+        confirmProjectButton.bezelStyle = .rounded
+        confirmProjectButton.target = self; confirmProjectButton.action = #selector(confirmProject)
+        recoveryRow.orientation = .horizontal; recoveryRow.alignment = .centerY; recoveryRow.spacing = 8
+        for item in [retryButton, projectField, confirmProjectButton] { recoveryRow.addArrangedSubview(item) }
+        for button in [retryButton, confirmProjectButton] {
+            button.setContentHuggingPriority(.required, for: .horizontal)
+            button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
 
         let heading = NSTextField(labelWithString: "希望 Codex 做什么？")
         heading.font = .systemFont(ofSize: 15, weight: .semibold)
@@ -1311,9 +1371,10 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
             responseScroll.bottomAnchor.constraint(equalTo: debugPanel.bottomAnchor, constant: -20),
             requestScroll.heightAnchor.constraint(equalTo: responseScroll.heightAnchor),
         ])
-        for item in [preview, recognition, heading, editor, messageLabel, debugButton, buttons] {
+        for item in [preview, recognition, recoveryRow, heading, editor, messageLabel, debugButton, buttons] {
             item.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(item)
         }
+        recoveryHeight = recoveryRow.heightAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             preview.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
             preview.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
@@ -1323,7 +1384,11 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
             recognition.leadingAnchor.constraint(equalTo: preview.leadingAnchor),
             recognition.trailingAnchor.constraint(equalTo: preview.trailingAnchor),
             recognition.heightAnchor.constraint(equalToConstant: 44),
-            heading.topAnchor.constraint(equalTo: recognition.bottomAnchor, constant: 10),
+            recoveryRow.topAnchor.constraint(equalTo: recognition.bottomAnchor),
+            recoveryRow.leadingAnchor.constraint(equalTo: preview.leadingAnchor),
+            recoveryRow.trailingAnchor.constraint(equalTo: preview.trailingAnchor),
+            recoveryHeight,
+            heading.topAnchor.constraint(equalTo: recoveryRow.bottomAnchor, constant: 10),
             heading.leadingAnchor.constraint(equalTo: preview.leadingAnchor),
             editor.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 8),
             editor.leadingAnchor.constraint(equalTo: preview.leadingAnchor),
@@ -1440,11 +1505,21 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
         originalImage = image; annotatedImage = nil; marks = []
         annotateButton.title = "标注截图…"
         preview.image = image
+        projectField.stringValue = ""
+        updateProjectChoices([], placeholder: "正在读取项目…")
+        resetDebug()
+        setSubmitting(false)
+        updateRecognition(.identifying)
+    }
+
+    func resetDebug() {
         debugSnapshot = nil
         requestText.string = "等待请求…"
         responseText.string = "等待响应…"
-        setSubmitting(false)
-        updateRecognition(.identifying)
+    }
+
+    func screenshotPixels() -> CGImage? {
+        originalImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
     }
 
     func updateRecognition(_ value: RecognitionProgress) {
@@ -1457,7 +1532,67 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
         statusIcon.image = NSImage(systemSymbolName: value.failed ? "exclamationmark.circle" : "checkmark.circle.fill", accessibilityDescription: value.failed ? "项目识别未完成" : "已识别项目")
         statusIcon.contentTintColor = value.failed ? .systemRed : .systemGreen
         if value.loading { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+        recoveryRow.isHidden = !value.failed
+        recoveryHeight.constant = value.failed ? 30 : 0
         refreshControls()
+    }
+
+    @objc private func retryRecognition() {
+        guard progress.failed, !submitting else { return }
+        window?.makeFirstResponder(textView)
+        onResolveProject?(nil)
+    }
+
+    @objc private func confirmProject() {
+        guard progress.failed, !submitting else { return }
+        guard let selection = selectedProject else { return }
+        window?.makeFirstResponder(textView)
+        onResolveProject?(selection)
+    }
+
+    private var selectedProject: ProjectChoice? {
+        let query = projectField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let index = projectField.indexOfSelectedItem
+        if matchingProjects.indices.contains(index), matchingProjects[index].label == query {
+            return matchingProjects[index]
+        }
+        let exactMatches = projectChoices.filter { $0.label == query }
+        if exactMatches.count == 1 { return exactMatches.first }
+        return !query.isEmpty && matchingProjects.count == 1 && matchingProjects[0].matches(query) ? matchingProjects.first : nil
+    }
+
+    func updateProjectChoices(_ choices: [ProjectChoice], placeholder: String = "搜索项目名或目录") {
+        projectChoices = choices
+        projectField.placeholderString = placeholder
+        projectField.isEnabled = !choices.isEmpty
+        filterProjectChoices()
+    }
+
+    private func filterProjectChoices() {
+        let query = projectField.stringValue
+        let matches = projectChoices.filter { $0.label == query || $0.matches(query) }
+        if matchingProjects != matches {
+            matchingProjects = matches
+            projectField.reloadData()
+        }
+        refreshControls()
+    }
+
+    func numberOfItems(in comboBox: NSComboBox) -> Int { matchingProjects.count }
+
+    func comboBox(_ comboBox: NSComboBox, objectValueForItemAt index: Int) -> Any? {
+        matchingProjects.indices.contains(index) ? matchingProjects[index].label : nil
+    }
+
+    func controlTextDidChange(_ notification: Notification) { filterProjectChoices() }
+
+    func comboBoxSelectionDidChange(_ notification: Notification) {
+        // AppKit updates the field editor after the selection notification.
+        DispatchQueue.main.async { [weak self] in self?.refreshControls() }
+    }
+
+    func comboBoxWillDismiss(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in self?.refreshControls() }
     }
 
     func setSubmitting(_ value: Bool, awaitingPreparation: Bool = false, startConversation: Bool = false) {
@@ -1488,6 +1623,7 @@ private final class CaptureInputController: NSWindowController, NSWindowDelegate
     private func refreshControls() {
         startButton.isEnabled = !submitting && !progress.failed && validDescription(textView.string)
         conversationButton.isEnabled = startButton.isEnabled
+        confirmProjectButton.isEnabled = progress.failed && !submitting && selectedProject != nil
         cancelButton.isEnabled = cancellable
         window?.standardWindowButton(.closeButton)?.isEnabled = cancellable
         textView.isEditable = !submitting
@@ -1533,7 +1669,10 @@ private final class CaptureInputSession {
     var pendingDescription: String?
     var startConversation = false
     var submissionInFlight = false
-    let startedAt = Date()
+    var startedAt = Date()
+    var context: [String: Any] = [:]
+    var manualProject: ProjectChoice?
+    var loadingProjectChoices = false
 
     init(temporary: URL) { self.temporary = temporary }
 
@@ -1940,13 +2079,13 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
             let window = NSRect(x: bounds[0], y: bounds[1], width: bounds[2], height: bounds[3])
             evidence["foregroundOverlap"] = window.contains(region) ? "inside" : (window.intersects(region) ? "partial" : "outside")
         }
+        session.context = evidence
         guard let bitmap = image.representations.first as? NSBitmapImageRep, let pixels = bitmap.cgImage else {
             session.preparationReturned = true
             preparationFailed(session, message: "无法读取截图。")
             return
         }
-        let screenshot = session.temporary.appendingPathComponent("screenshot.png")
-        startPreparation(session, screenshot: screenshot, context: evidence, pixels: pixels)
+        startPreparation(session, pixels: pixels)
     }
 
     private func discardSelectionSession() {
@@ -1961,8 +2100,9 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
             return
         }
         let session = CaptureInputSession(temporary: temporary)
+        session.context = context
         showDescription(image: image, session: session)
-        startPreparation(session, screenshot: screenshot, context: context)
+        startPreparation(session)
     }
 
     private func showDescription(image: NSImage, session: CaptureInputSession, marks: [CaptureMark] = [], annotated: NSImage? = nil) {
@@ -1980,11 +2120,12 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         controller.updateRecognition(session.progress)
         if let stateURL = session.stateURL { controller.updateDebug(directory: stateURL.deletingLastPathComponent()) }
         inputSession = session
+        if session.progress.failed { loadProjectChoices(session) }
         controller.onSubmit = { [weak self, weak session, weak controller] text, startConversation in
             guard let self, let session, self.inputSession === session else { return }
             session.pendingDescription = text
             session.startConversation = startConversation
-            controller?.setSubmitting(true, awaitingPreparation: session.preparationID == nil, startConversation: startConversation)
+            controller?.setSubmitting(true, awaitingPreparation: session.progress.loading, startConversation: startConversation)
             self.state = "submitting"; self.writeStatus()
             self.submitPreparedSession(session)
         }
@@ -1992,20 +2133,44 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
             guard let self, let session else { return }
             self.cancelInputSession(session)
         }
+        controller.onResolveProject = { [weak self, weak session, weak controller] project in
+            guard let self, let session, self.inputSession === session, session.progress.failed else { return }
+            if let id = session.preparationID { self.discardPreparation(id) }
+            session.preparationID = nil
+            session.stateURL = nil
+            session.preparationWorkerPID = nil
+            session.manualProject = project
+            controller?.resetDebug()
+            self.lastError = nil
+            self.updateRecognition(session, project == nil ? .identifying : .checkingProject)
+            self.writeStatus()
+            let screenshot = session.temporary.appendingPathComponent("screenshot.png")
+            let pixels = FileManager.default.fileExists(atPath: screenshot.path) ? nil : controller?.screenshotPixels()
+            self.startPreparation(session, pixels: pixels)
+        }
         state = "awaiting_description"; writeStatus()
         controller.present()
     }
 
-    private func startPreparation(_ session: CaptureInputSession, screenshot: URL, context: [String: Any], pixels: CGImage? = nil) {
+    private func startPreparation(_ session: CaptureInputSession, pixels: CGImage? = nil) {
+        session.startedAt = Date()
+        session.preparationReturned = false
+        session.preparationFinished = false
         let temporary = session.temporary
+        let screenshot = temporary.appendingPathComponent("screenshot.png")
         let contextFile = temporary.appendingPathComponent("context.json")
-        var evidence = context
+        var evidence = session.context
         evidence.removeValue(forKey: "windowBounds")
         let captureContext = evidence
+        var arguments = ["prepare", "--image", screenshot.path, "--context-file", contextFile.path]
+        if let project = session.manualProject {
+            arguments += ["--project-id=" + project.id, "--project-root=" + project.root]
+        }
+        let commandArguments = arguments
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 if let pixels {
-                    try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                    try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
                     guard let data = NSBitmapImageRep(cgImage: pixels).representation(using: .png, properties: [:]) else {
                         throw NSError(domain: appID, code: 1, userInfo: [NSLocalizedDescriptionKey: "无法保存截图。"])
                     }
@@ -2013,7 +2178,7 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: screenshot.path)
                 }
                 try writeJSON(captureContext, to: contextFile)
-                let result = try command(launcherURL.path, ["prepare", "--image", screenshot.path, "--context-file", contextFile.path], timeout: 30)
+                let result = try command(launcherURL.path, commandArguments, timeout: 30)
                 let prepared = preparationReply(result.output)
                 DispatchQueue.main.async {
                     session.preparationReturned = true
@@ -2034,7 +2199,6 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
                         return
                     }
                     self.startPreparationPolling(session)
-                    self.submitPreparedSession(session)
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -2059,6 +2223,31 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         if selectionSession === session { captureOverlay?.updateRecognition(progress) }
     }
 
+    private func loadProjectChoices(_ session: CaptureInputSession) {
+        guard !session.loadingProjectChoices else { return }
+        session.loadingProjectChoices = true
+        let candidates = session.stateURL?.deletingLastPathComponent().appendingPathComponent("projects.json")
+        DispatchQueue.global(qos: .userInitiated).async {
+            var choices: [ProjectChoice]?
+            if let candidates, let data = try? Data(contentsOf: candidates) {
+                choices = ProjectChoice.decode(data)
+            }
+            if choices?.isEmpty != false,
+               let result = try? command(launcherURL.path, ["list-projects"], timeout: 30),
+               result.code == 0 {
+                choices = ProjectChoice.decode(Data(result.output.utf8))
+            }
+            let result = choices
+            DispatchQueue.main.async {
+                session.loadingProjectChoices = false
+                guard self.inputSession === session else { return }
+                let placeholder = result?.isEmpty == false ? "搜索项目名或目录"
+                    : result == nil ? "无法读取项目列表" : "没有可用的 Codex 项目"
+                session.controller?.updateProjectChoices(result ?? [], placeholder: placeholder)
+            }
+        }
+    }
+
     private func preparationFailed(_ session: CaptureInputSession, message: String) {
         guard isCurrentSession(session) else { return }
         session.pendingDescription = nil
@@ -2067,7 +2256,10 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         if let preparationID = session.preparationID { discardPreparation(preparationID) }
         session.controller?.setSubmitting(false)
         updateRecognition(session, RecognitionProgress(title: "项目识别未完成", detail: message, loading: false, failed: true))
-        if inputSession === session { lastError = message; state = "awaiting_description"; writeStatus() }
+        if inputSession === session {
+            loadProjectChoices(session)
+            lastError = message; state = "awaiting_description"; writeStatus()
+        }
     }
 
     private func startPreparationPolling(_ session: CaptureInputSession) {
@@ -2093,19 +2285,20 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
         }
         guard let record = readRecord() else {
             if Date().timeIntervalSince(session.startedAt) > 30 {
-                preparationFailed(session, message: "无法读取项目识别状态，请取消后重新截图。")
+                preparationFailed(session, message: "无法读取项目识别状态。")
             }
             return
         }
         session.controller?.updateDebug(directory: stateURL.deletingLastPathComponent())
-        var progress = RecognitionProgress(state: record)
+        let manual = session.manualProject != nil
+        var progress = RecognitionProgress(state: record, manual: manual)
         if progress.loading, let pid = record["workerPid"] as? Int ?? session.preparationWorkerPID,
            pid <= 1 || pid > Int(Int32.max) || kill(pid_t(pid), 0) != 0 {
             // The worker writes its terminal state before exiting. Refresh the
             // earlier loading snapshot before deciding that recognition failed.
-            if let latest = readRecord() { progress = RecognitionProgress(state: latest) }
+            if let latest = readRecord() { progress = RecognitionProgress(state: latest, manual: manual) }
             if progress.loading {
-                preparationFailed(session, message: "项目识别进程已退出，请取消后重新截图。")
+                preparationFailed(session, message: "项目识别进程已退出。")
                 return
             }
         }
@@ -2116,17 +2309,20 @@ private final class CaptureDelegate: NSObject, NSApplicationDelegate, NSMenuDele
             if progress.failed && inputSession === session {
                 session.pendingDescription = nil
                 session.controller?.setSubmitting(false)
+                loadProjectChoices(session)
                 lastError = progress.detail; state = "awaiting_description"; writeStatus()
+            } else if !progress.failed {
+                submitPreparedSession(session)
             }
         } else if record["workerPid"] == nil && session.preparationWorkerPID == nil && Date().timeIntervalSince(session.startedAt) > 10 {
-            preparationFailed(session, message: "项目识别进程未能启动，请取消后重新截图。")
+            preparationFailed(session, message: "项目识别进程未能启动。")
         } else if Date().timeIntervalSince(session.startedAt) > 300 {
-            preparationFailed(session, message: "项目识别等待超时，请取消后重新截图。")
+            preparationFailed(session, message: "项目识别等待超时。")
         }
     }
 
     private func submitPreparedSession(_ session: CaptureInputSession) {
-        guard inputSession === session, !session.cancelled, !session.submissionInFlight,
+        guard inputSession === session, !session.cancelled, !session.submissionInFlight, !session.progress.loading, !session.progress.failed,
               let controller = session.controller, let preparationID = session.preparationID,
               let text = session.pendingDescription else { return }
         let annotatedURL = session.temporary.appendingPathComponent("annotated.png")
@@ -2312,6 +2508,27 @@ private final class CapturePreviewDelegate: NSObject, NSApplicationDelegate {
         ])
         controller.onCancel = { controller.dismiss(); NSApp.terminate(nil) }
         controller.onSubmit = { _, _ in controller.showSubmissionError("这是界面预览，不会创建任务。") }
+        if CommandLine.arguments.contains("--preview-recovery") {
+            let failure = RecognitionProgress(state: ["phase": "needs_input", "error": "截图中的项目线索不足。"])
+            controller.updateProjectChoices([
+                ProjectChoice(id: "demo-notes", name: "Demo Notes", root: "/demo/workspace/notes"),
+                ProjectChoice(id: "demo-board", name: "Demo Board", root: "/demo/workspace/board"),
+            ])
+            controller.onResolveProject = { [weak controller] choice in
+                guard let controller else { return }
+                if let choice {
+                    controller.updateRecognition(RecognitionProgress(state: ["phase": "ready", "project": ["name": choice.name]], manual: true))
+                } else {
+                    controller.updateRecognition(.identifying)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak controller] in
+                        controller?.updateRecognition(failure)
+                    }
+                }
+            }
+            controller.updateRecognition(failure)
+            controller.present()
+            return
+        }
         controller.present()
         if !CommandLine.arguments.contains("--preview-loading") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
@@ -2420,6 +2637,9 @@ if CommandLine.arguments.contains("--probe-screens") {
     precondition(!recognized.loading && !recognized.failed && recognized.title == "项目：Fixture")
     precondition(RecognitionProgress(state: ["phase": "ready"]).failed)
     precondition(RecognitionProgress(state: ["phase": "failed", "error": "fixture failure"]).detail == "fixture failure")
+    let choices = ProjectChoice.decode(Data(#"[{"id":"notes","name":"Démo Notes","roots":["/demo/workspace/notebook"]}]"#.utf8))!
+    precondition(choices.count == 1 && choices[0].matches("dmo ntbk") && !choices[0].matches("board"))
+    precondition(RecognitionProgress(state: ["phase": "classifying"], manual: true) == .checkingProject)
     let preparationID = "00000000-0000-4000-8000-000000000001"
     let expectedState = dataDirectory.appendingPathComponent("preparations/" + preparationID + "/state.json").path
     let validReply = try JSONSerialization.data(withJSONObject: ["preparationId": preparationID, "statePath": expectedState])

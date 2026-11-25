@@ -89,8 +89,8 @@ class PreparationTests(unittest.TestCase):
         self.project_root.mkdir()
         self.project = {"id": "project-fixture", "name": "Fixture project", "roots": [{"path": str(self.project_root)}]}
 
-    def prepare(self, context_file=None):
-        args = argparse.Namespace(image=str(self.image), context_file=context_file)
+    def prepare(self, context_file=None, **options):
+        args = argparse.Namespace(image=str(self.image), context_file=context_file, **options)
         with mock.patch.object(capture.subprocess, "Popen", return_value=mock.Mock(pid=1234)) as spawn:
             result = capture.create_preparation(args)
         return result, spawn
@@ -105,9 +105,9 @@ class PreparationTests(unittest.TestCase):
             capture.run_preparation(result["preparationId"])
         return server
 
-    def submit(self, result, text="  Change the fixture button.\n\n "):
+    def submit(self, result, text="  Change the fixture button.\n\n ", **options):
         args = argparse.Namespace(image=None, context_file=None, preparation_id=result["preparationId"], text=text,
-                                  followup="", model=None, no_open=True, read_only=False)
+                                  followup="", model=None, no_open=True, read_only=False, **options)
         output = io.StringIO()
         with mock.patch.object(capture.subprocess, "Popen", return_value=mock.Mock(pid=4321)) as spawn, contextlib.redirect_stdout(output):
             capture.submit(args)
@@ -349,6 +349,45 @@ class PreparationTests(unittest.TestCase):
                 with self.assertRaises(capture.NeedsInput):
                     self.submit(result)
         self.assertFalse((self.data / "jobs").exists())
+
+    def test_manual_selection_after_repeated_failure_reuses_image_without_classification(self):
+        for options in ({"confidence": 0.3}, {"fail": True}):
+            attempt, _ = self.prepare()
+            self.classify(attempt, **options)
+            capture.cancel_preparation(attempt["preparationId"])
+        selection, _ = self.prepare(project_id=self.project["id"], project_root=str(self.project_root))
+        lookup = FixtureServer(self.directory(selection), self.project)
+        with mock.patch.object(capture, "AppServer", return_value=lookup), \
+             mock.patch.object(capture, "_request_preparation") as classifier:
+            capture.request_preparation(selection["preparationId"])
+        classifier.assert_not_called()
+        self.assertFalse(lookup.requests)
+        self.assertFalse(lookup.turns)
+        prepared = capture.read_json(Path(selection["statePath"]))
+        self.assertEqual(prepared["phase"], "ready")
+        self.assertEqual(prepared["cwd"], str(self.project_root))
+
+        annotation = self.root / "annotated.png"
+        annotation.write_bytes(b"synthetic annotation")
+        job, _ = self.submit(selection, annotated_image=str(annotation))
+        formal = FixtureServer(Path(job["statePath"]).parent, self.project)
+        with mock.patch.object(capture, "AppServer", return_value=formal):
+            capture.run_job(job["jobId"])
+        self.assertEqual(capture.read_json(Path(job["statePath"]))["phase"], "completed")
+        self.assertEqual([turn[2] for turn in formal.turns], ["initial"])
+        self.assertEqual(formal.requests[0][1]["projectId"], self.project["id"])
+        inputs = formal.turns[0][1]
+        self.assertEqual(inputs[0]["text"], "  Change the fixture button.\n\n ")
+        self.assertEqual([Path(item["path"]).read_bytes() for item in inputs[1:] if item["type"] == "localImage"],
+                         [b"synthetic image bytes", b"synthetic annotation"])
+
+    def test_manual_selection_rejects_mismatched_project_and_root(self):
+        selection, _ = self.prepare(project_id=self.project["id"], project_root=str(self.root))
+        lookup = self.classify(selection)
+        self.assertEqual(capture.read_json(Path(selection["statePath"]))["phase"], "needs_input")
+        self.assertFalse(lookup.turns)
+        with self.assertRaises(capture.NeedsInput):
+            self.submit(selection)
 
     def test_failure_after_submit_is_reported_without_reclassification_or_formal_task(self):
         result, _ = self.prepare()
