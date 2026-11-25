@@ -47,7 +47,7 @@ pnpm test:browser
 
 浏览器测试启动独立的浏览器进程，不使用个人浏览器资料。`CAPTURE_BROWSER_CHANNEL=chrome` 使用本机 Chrome；省略后使用 Playwright 已安装的 Chromium。安装包携带构建产物，最终安装时会校验缓存与源码一致。
 
-原生输入窗口可在编译助手后运行 `CodexCapture --preview-input` 查看合成截图及模拟识别结果，或加 `--preview-loading` 保持识别中的状态。`--preview-capture` 使用同一合成图片和虚构 AX 树，验证选区浮层与侧栏；完成后进入合成需求窗口。预览不注册热键、不读取任务数据，也不请求系统权限；它验证布局和交互，不代表真实模型识别已验收。
+原生输入窗口可在编译助手后运行 `CodexCapture --preview-input` 查看合成截图及模拟识别结果，或加 `--preview-loading` 保持识别中的状态。加 `--preview-recovery` 可复现识别失败和重试失败，并用虚构项目验证下拉框搜索和手动选择。`--preview-capture` 使用同一合成图片和虚构 AX 树，验证选区浮层与侧栏；完成后进入合成需求窗口。预览不注册热键、不读取任务数据，也不请求系统权限；它验证布局和交互，不代表真实模型识别已验收。
 
 本机签名身份完成初始化后，可显式运行不同构建的签名互验：
 

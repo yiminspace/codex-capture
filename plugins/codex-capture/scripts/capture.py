@@ -557,6 +557,19 @@ def resolve_route(route, projects):
     return project, root
 
 
+def manual_route(server, directory, selection):
+    projects = eligible_projects(server.projects())
+    atomic_json(directory / "projects.json", projects)
+    route = {**selection, "confidence": 1, "reason": "用户手动指定项目"}
+    try:
+        project, root = resolve_route(route, projects)
+    except NeedsInput:
+        raise NeedsInput("这个项目或目录已不可用，请重新选择。") from None
+    route["title"] = project["name"]
+    atomic_json(directory / "route.json", route)
+    return route, project, root
+
+
 def route_schema(projects):
     return {"type": "object", "additionalProperties": False, "properties": {
         "projectId": {"type": ["string", "null"], "enum": [p["id"] for p in projects]+[None]},
@@ -687,7 +700,10 @@ def create_preparation(args):
     image = directory / ("screenshot" + source.suffix.lower())
     shutil.copyfile(source, image)
     os.chmod(image, 0o600)
-    atomic_json(directory / "request.json", {"image": str(image), "context": context, "classifierModel": read_settings().get("classifierModel", "gpt-6-luna")})
+    request = {"image": str(image), "context": context, "classifierModel": read_settings().get("classifierModel", "gpt-6-luna")}
+    if getattr(args, "project_id", None) is not None:
+        request["manualProject"] = {"projectId": args.project_id, "rootPath": args.project_root}
+    atomic_json(directory / "request.json", request)
     atomic_json(directory / "state.json", {"preparationId": preparation_id, "phase": "queued", "createdAt": now()})
     with (directory / "worker.log").open("a") as log:
         try:
@@ -700,6 +716,16 @@ def create_preparation(args):
 
 def prepare(args):
     print(json.dumps(create_preparation(args), ensure_ascii=False))
+
+
+def list_projects():
+    directory = DATA / "doctor"
+    directory.mkdir(parents=True, exist_ok=True)
+    server = AppServer(directory)
+    try:
+        print(json.dumps(eligible_projects(server.projects()), ensure_ascii=False))
+    finally:
+        server.close()
 
 
 def run_preparation(preparation_id, server_factory=None):
@@ -724,8 +750,13 @@ def run_preparation(preparation_id, server_factory=None):
             save("connecting", workerPid=os.getpid(), startedAt=now())
             server = (server_factory or AppServer)(directory)
             save("classifying", appServerPid=server.process.pid, runtime=server.info)
-            route, project, root, elapsed = classify_project(server, directory, read_json(directory / "request.json"), save)
-            outcome = {"route": route, "project": project, "cwd": root, "classificationSeconds": elapsed}
+            request = read_json(directory / "request.json")
+            if "manualProject" in request:
+                route, project, root = manual_route(server, directory, request["manualProject"])
+                outcome = {"route": route, "project": project, "cwd": root}
+            else:
+                route, project, root, elapsed = classify_project(server, directory, request, save)
+                outcome = {"route": route, "project": project, "cwd": root, "classificationSeconds": elapsed}
         except Cancelled as exc:
             save("cancelled", error=str(exc))
         except NeedsInput as exc:
@@ -863,6 +894,9 @@ def serve_classifier(idle_timeout=120):
 
 def request_preparation(preparation_id):
     try:
+        directory = preparation_dir(preparation_id)
+        if "manualProject" in read_json(directory / "request.json"):
+            return run_preparation(preparation_id)
         return _request_preparation(preparation_id)
     except Exception as error:
         directory = preparation_dir(preparation_id)
@@ -1566,6 +1600,8 @@ def main():
     p = sub.add_parser("prepare", help="截图后立即在后台识别项目")
     p.add_argument("--image", required=True)
     p.add_argument("--context-file")
+    p.add_argument("--project-id", help="手动指定已登记的 Codex 项目 ID")
+    p.add_argument("--project-root", help="手动指定该项目的已登记根目录")
     p = sub.add_parser("_prepare", help=argparse.SUPPRESS)
     p.add_argument("preparation_id")
     p = sub.add_parser("discard-preparation", help="取消尚未提交的截图识别")
@@ -1578,6 +1614,7 @@ def main():
     p.add_argument("job_id")
     sub.add_parser("_classifier-service", help=argparse.SUPPRESS)
     sub.add_parser("doctor")
+    sub.add_parser("list-projects", help="列出可用的 Codex 项目及根目录")
     p = sub.add_parser("gui", help="打开进度、历史与诊断工作台")
     p.add_argument("--job", help="打开指定任务")
     p.add_argument("--no-open", action="store_true", help="启动服务并返回地址，不打开浏览器")
@@ -1588,7 +1625,11 @@ def main():
     elif args.command == "capture":
         capture(args)
     elif args.command == "prepare":
+        if (args.project_id is None) != (args.project_root is None):
+            parser.error("--project-id 和 --project-root 必须同时指定。")
         prepare(args)
+    elif args.command == "list-projects":
+        list_projects()
     elif args.command == "_prepare":
         request_preparation(args.preparation_id)
     elif args.command == "_classifier-service":
